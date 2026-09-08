@@ -35,7 +35,9 @@ pub fn unescape(text: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // `find` returns a char boundary; a byte-sliced window would not, and
+        // any multi-byte character inside it would panic.
+        let Some(end) = rest.find(';').filter(|&at| at <= 12) else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -127,6 +129,14 @@ mod tests {
     fn numeric_entities_decode_and_unknown_ones_are_left_alone() {
         assert_eq!(unescape("caf&#233; &#x41;"), "café A");
         assert_eq!(unescape("Q&A and &notreal; stay"), "Q&A and &notreal; stay");
+    }
+
+    #[test]
+    fn a_bare_ampersand_next_to_wide_characters_does_not_panic() {
+        assert_eq!(unescape("a & │──────│ b"), "a & │──────│ b");
+        assert_eq!(unescape("┌───┐ &amp; └───┘"), "┌───┐ & └───┘");
+        assert_eq!(unescape("&"), "&");
+        assert_eq!(unescape("│&nbsp;│"), "│ │");
     }
 
     #[test]
