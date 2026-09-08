@@ -20,9 +20,33 @@ pub struct Extracted {
 /// This is what a feed reader means by "parse full content": the publisher
 /// only sent a teaser, so the page itself has to be scraped.
 pub fn from_url(fetcher: &Fetcher, url: &str) -> Result<Extracted> {
+    if let Some(reason) = unreachable_by_fetching(url) {
+        return Err(Error::Extract {
+            url: url.to_string(),
+            message: reason.into(),
+        });
+    }
     let page = fetcher.get_page(url)?;
     let html = charset::decode(&page.bytes, page.content_type.as_deref());
     from_html(&html, url)
+}
+
+/// Some aggregators publish a link that only a browser can follow. Saying so
+/// is more use than a scoring failure five hundred kilobytes later.
+fn unreachable_by_fetching(url: &str) -> Option<&'static str> {
+    let host = url
+        .split_once("://")
+        .map_or(url, |(_, rest)| rest)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match host.as_str() {
+        "news.google.com" => Some(
+            "Google News links resolve only in a browser; subscribe to the publisher's own feed",
+        ),
+        _ => None,
+    }
 }
 
 /// Readability keeps the page's own headline, which the reader is already
@@ -147,6 +171,14 @@ mod tests {
     fn a_heading_that_says_something_else_is_kept() {
         let content = "<div><h1>Part One</h1><p>Body text.</p></div>";
         assert_eq!(drop_repeated_heading(content, "The Headline"), content);
+    }
+
+    #[test]
+    fn a_google_news_link_says_why_it_cannot_be_read() {
+        let fetcher = crate::Fetcher::new();
+        let url = "https://news.google.com/rss/articles/CBMiTkFV?oc=5";
+        let error = from_url(&fetcher, url).unwrap_err();
+        assert!(error.to_string().contains("publisher's own feed"));
     }
 
     #[test]
