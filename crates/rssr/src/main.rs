@@ -259,7 +259,11 @@ fn extract_items(store: &Store, ids: &[String], as_json: bool) -> Result<ExitCod
         };
         match extract::from_url(&fetcher, &url) {
             Ok(article) => {
-                store.save_body(id, &article.content, "extracted")?;
+                let content = match store.body(id)?.and_then(|body| body.title) {
+                    Some(title) => extract::drop_repeated_heading(&article.content, &title),
+                    None => article.content,
+                };
+                store.save_body(id, &content, "extracted")?;
                 results.push(json!({ "id": id, "ok": true, "chars": article.chars, "url": url }));
             }
             Err(e) => {

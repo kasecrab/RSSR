@@ -16,6 +16,12 @@ pub struct Validators {
 }
 
 #[derive(Debug)]
+pub struct Page {
+    pub bytes: Vec<u8>,
+    pub content_type: Option<String>,
+}
+
+#[derive(Debug)]
 pub enum Fetched {
     NotModified,
     Body {
@@ -70,7 +76,7 @@ impl Fetcher {
 
     /// Fetches an article page rather than a feed: no validators, since the
     /// body is extracted once and then kept.
-    pub fn get_page(&self, url: &str) -> Result<Vec<u8>> {
+    pub fn get_page(&self, url: &str) -> Result<Page> {
         let mut resp = self
             .agent
             .get(url)
@@ -89,14 +95,21 @@ impl Fetcher {
             });
         }
 
-        resp.body_mut()
+        let content_type = header(&resp, "content-type");
+        let bytes = resp
+            .body_mut()
             .with_config()
             .limit(MAX_PAGE_BYTES)
             .read_to_vec()
             .map_err(|e| Error::Http {
                 url: url.to_string(),
                 message: e.to_string(),
-            })
+            })?;
+
+        Ok(Page {
+            bytes,
+            content_type,
+        })
     }
 
     pub fn get(&self, url: &str, cached: &Validators) -> Result<Fetched> {

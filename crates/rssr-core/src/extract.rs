@@ -1,7 +1,7 @@
 use dom_smoothie::{Article, Config, Readability};
 
 use crate::fetch::Fetcher;
-use crate::{Error, Result};
+use crate::{Error, Result, charset};
 
 /// Readability always returns its best guess, and on a page with no article
 /// that guess is the navigation. Anything this short is not worth keeping over
@@ -20,9 +20,48 @@ pub struct Extracted {
 /// This is what a feed reader means by "parse full content": the publisher
 /// only sent a teaser, so the page itself has to be scraped.
 pub fn from_url(fetcher: &Fetcher, url: &str) -> Result<Extracted> {
-    let bytes = fetcher.get_page(url)?;
-    let html = String::from_utf8_lossy(&bytes);
+    let page = fetcher.get_page(url)?;
+    let html = charset::decode(&page.bytes, page.content_type.as_deref());
     from_html(&html, url)
+}
+
+/// Readability keeps the page's own headline, which the reader is already
+/// showing from the feed. Drop it when the two say the same thing.
+pub fn drop_repeated_heading(content: &str, title: &str) -> String {
+    let title = title.trim();
+    if title.is_empty() {
+        return content.to_string();
+    }
+    let Some(start) = content.find("<h1") else {
+        return content.to_string();
+    };
+    let Some(end) = content[start..].find("</h1>").map(|at| start + at + 5) else {
+        return content.to_string();
+    };
+    if content[..start].contains('>') && !content[..start].trim_end().ends_with('>') {
+        return content.to_string();
+    }
+    if text_of(&content[start..end]).eq_ignore_ascii_case(title) {
+        let mut out = String::with_capacity(content.len());
+        out.push_str(content[..start].trim_end());
+        out.push_str(&content[end..]);
+        return out;
+    }
+    content.to_string()
+}
+
+fn text_of(html: &str) -> String {
+    let mut out = String::new();
+    let mut inside_tag = false;
+    for ch in html.chars() {
+        match ch {
+            '<' => inside_tag = true,
+            '>' => inside_tag = false,
+            _ if !inside_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
 }
 
 pub fn from_html(html: &str, url: &str) -> Result<Extracted> {
@@ -95,6 +134,19 @@ mod tests {
         let article = from_html(PAGE, "https://example.com/post").unwrap();
         assert_eq!(article.title.as_deref(), Some("The Headline"));
         assert!(article.chars > 100);
+    }
+
+    #[test]
+    fn a_heading_that_repeats_the_feed_title_is_dropped() {
+        let content = "<div><h1>The Headline</h1><p>Body text.</p></div>";
+        let trimmed = drop_repeated_heading(content, "The Headline");
+        assert_eq!(trimmed, "<div><p>Body text.</p></div>");
+    }
+
+    #[test]
+    fn a_heading_that_says_something_else_is_kept() {
+        let content = "<div><h1>Part One</h1><p>Body text.</p></div>";
+        assert_eq!(drop_repeated_heading(content, "The Headline"), content);
     }
 
     #[test]

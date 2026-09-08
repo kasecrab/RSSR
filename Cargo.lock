@@ -1190,6 +1190,7 @@ dependencies = [
  "chrono",
  "dirs",
  "dom_smoothie",
+ "encoding_rs",
  "feed-rs",
  "htmd",
  "http",

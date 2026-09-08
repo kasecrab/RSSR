@@ -1,3 +1,4 @@
+pub mod charset;
 pub mod content;
 pub mod duration;
 mod error;

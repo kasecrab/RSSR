@@ -8,6 +8,7 @@ license.workspace = true
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 dirs = "7.0.0"
 dom_smoothie = "0.18.1"
+encoding_rs = "0.8.40"
 feed-rs = "2.4.0"
 htmd = "0.5.5"
 http = "1.5.0"
