@@ -878,6 +878,7 @@ dependencies = [
  "chrono",
  "dirs",
  "feed-rs",
+ "http",
  "quick-xml 0.42.0",
  "rusqlite",
  "serde",
