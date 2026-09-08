@@ -514,7 +514,9 @@ impl Store {
         })?;
         let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
         let items = collapse_duplicates(items, query);
-        Ok(cap_per_feed(items, query))
+        let mut items = cap_per_feed(items, query);
+        items.truncate(query.limit);
+        Ok(items)
     }
 
     /// How many items the query matches in total, so a caller never has to
@@ -773,7 +775,6 @@ fn cap_per_feed(items: Vec<Item>, query: &Query) -> Vec<Item> {
             *count += 1;
             *count <= per_feed
         })
-        .take(query.limit)
         .collect()
 }
 
@@ -973,6 +974,25 @@ mod tests {
             .unwrap();
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0].duplicates, 1);
+    }
+
+    #[test]
+    fn the_limit_still_holds_once_duplicates_are_collapsed() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        let many: Vec<_> = (0..30)
+            .map(|n| item(&format!("i{n}"), &format!("Story {n}")))
+            .collect();
+        store.save_items(feed, &many).unwrap();
+
+        let page = store
+            .items(&Query {
+                dedupe: true,
+                limit: 4,
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(page.len(), 4);
     }
 
     #[test]
