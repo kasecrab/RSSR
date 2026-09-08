@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::mpsc;
+use std::time::Duration;
+
+use chrono::Utc;
 
 use crate::fetch::{Fetched, Fetcher, Validators};
 use crate::parse::{self, ParsedFeed};
@@ -10,11 +13,17 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Copy)]
 pub struct Options {
     pub workers: usize,
+    /// Leave a feed alone if it was fetched more recently than this. Skipped
+    /// feeds cost no request at all, not even a conditional one.
+    pub max_age: Option<Duration>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { workers: 16 }
+        Options {
+            workers: 16,
+            max_age: None,
+        }
     }
 }
 
@@ -22,6 +31,7 @@ impl Default for Options {
 pub enum Status {
     Updated { new_items: usize },
     NotModified,
+    Skipped { age_secs: u64 },
     Failed { code: &'static str, message: String },
 }
 
@@ -58,21 +68,31 @@ struct Done {
 /// fetch and parse; the database is written here, on one thread, in one
 /// transaction per feed.
 pub fn refresh(store: &mut Store, fetcher: &Fetcher, options: Options) -> Result<Summary> {
-    let feeds = store.feeds()?;
-    if feeds.is_empty() {
-        return Ok(Summary::default());
+    let mut summary = Summary::default();
+    let mut due = Vec::new();
+    for feed in store.feeds()? {
+        match fresh_for(&feed, options.max_age) {
+            Some(age_secs) => summary.outcomes.push(FeedOutcome {
+                url: feed.url,
+                status: Status::Skipped { age_secs },
+                elapsed_ms: 0,
+            }),
+            None => due.push(feed),
+        }
+    }
+    if due.is_empty() {
+        summary.outcomes.sort_by(|a, b| a.url.cmp(&b.url));
+        return Ok(summary);
     }
 
     let mut by_host: HashMap<String, Vec<Feed>> = HashMap::new();
-    for feed in feeds {
+    for feed in due {
         by_host.entry(host_of(&feed.url)).or_default().push(feed);
     }
 
     let queue = Mutex::new(by_host.into_values().collect::<Vec<_>>());
     let workers = options.workers.clamp(1, queue.lock().unwrap().len());
     let (tx, rx) = mpsc::sync_channel::<Done>(workers * 2);
-
-    let mut summary = Summary::default();
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -174,6 +194,14 @@ fn write_one(store: &mut Store, done: Done) -> Result<FeedOutcome> {
     })
 }
 
+/// How long ago the feed was fetched, when that is still inside `max_age`.
+fn fresh_for(feed: &Feed, max_age: Option<Duration>) -> Option<u64> {
+    let max_age = max_age?;
+    let fetched_at = feed.fetched_at?;
+    let age = Utc::now().signed_duration_since(fetched_at).to_std().ok()?;
+    (age < max_age).then_some(age.as_secs())
+}
+
 /// A feed URL that has quietly become a web page is the common case behind a
 /// parse failure, and the raw XML error does not say so.
 fn explain(error: Error, content_type: Option<&str>) -> Error {
@@ -257,7 +285,15 @@ mod tests {
         subscribe(&mut store, &serve(RSS, "200 OK"));
         subscribe(&mut store, &serve(RSS, "200 OK"));
 
-        let summary = refresh(&mut store, &Fetcher::new(), Options { workers: 4 }).unwrap();
+        let summary = refresh(
+            &mut store,
+            &Fetcher::new(),
+            Options {
+                workers: 4,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         assert_eq!(summary.outcomes.len(), 2);
         assert_eq!(summary.new_items, 2);
         assert_eq!(summary.failed, 0);
@@ -295,7 +331,15 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        let summary = refresh(&mut store, &Fetcher::new(), Options { workers: 4 }).unwrap();
+        let summary = refresh(
+            &mut store,
+            &Fetcher::new(),
+            Options {
+                workers: 4,
+                ..Options::default()
+            },
+        )
+        .unwrap();
         let elapsed = started.elapsed();
 
         assert_eq!(summary.failed, 0);
@@ -303,6 +347,24 @@ mod tests {
             elapsed < Duration::from_millis(900),
             "four 300ms feeds took {elapsed:?}, so they ran one after another"
         );
+    }
+
+    #[test]
+    fn a_recent_feed_is_skipped_without_a_request() {
+        let mut store = Store::open_in_memory().unwrap();
+        subscribe(&mut store, &serve(RSS, "200 OK"));
+        let fetcher = Fetcher::new();
+        let options = Options {
+            max_age: Some(Duration::from_secs(3600)),
+            ..Options::default()
+        };
+
+        let first = refresh(&mut store, &fetcher, options).unwrap();
+        assert!(matches!(first.outcomes[0].status, Status::Updated { .. }));
+
+        let second = refresh(&mut store, &fetcher, options).unwrap();
+        assert!(matches!(second.outcomes[0].status, Status::Skipped { .. }));
+        assert_eq!(second.outcomes[0].elapsed_ms, 0);
     }
 
     #[test]

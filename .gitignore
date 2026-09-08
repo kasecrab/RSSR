@@ -1,1 +1,7 @@
 /target
+/scratch
+/local.just
+*.opml
+*.db
+*.db-wal
+*.db-shm

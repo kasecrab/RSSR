@@ -89,6 +89,7 @@ pub struct Feed {
     pub folder: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    pub fetched_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone)]
@@ -227,7 +228,7 @@ impl Store {
 
     pub fn feeds(&self) -> Result<Vec<Feed>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, url, title, folder, etag, last_modified
+            "SELECT id, url, title, folder, etag, last_modified, fetched_at
              FROM feeds ORDER BY folder IS NULL, folder, title, url",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -238,6 +239,7 @@ impl Store {
                 folder: row.get(3)?,
                 etag: row.get(4)?,
                 last_modified: row.get(5)?,
+                fetched_at: row.get::<_, Option<String>>(6)?.and_then(parse_stamp),
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -445,6 +447,12 @@ impl Store {
             .ok_or_else(|| Error::Config("no data directory for this platform".into()))?;
         Ok(dir.join("rssr").join("rssr.db"))
     }
+}
+
+fn parse_stamp(value: String) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(&value)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {

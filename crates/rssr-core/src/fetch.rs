@@ -28,6 +28,8 @@ pub struct Fetcher {
     agent: Agent,
 }
 
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
 impl Default for Fetcher {
     fn default() -> Self {
         Self::new()
@@ -36,9 +38,20 @@ impl Default for Fetcher {
 
 impl Fetcher {
     pub fn new() -> Self {
+        Self::with_timeout(DEFAULT_TIMEOUT)
+    }
+
+    /// The stage timeouts matter as much as the ceiling: a server that accepts
+    /// the connection and then says nothing is the common way one feed holds
+    /// up a whole refresh.
+    pub fn with_timeout(timeout: Duration) -> Self {
+        let stage = timeout.min(Duration::from_secs(6));
         let config = Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(15)))
-            .timeout_connect(Some(Duration::from_secs(10)))
+            .timeout_global(Some(timeout))
+            .timeout_resolve(Some(Duration::from_secs(3)))
+            .timeout_connect(Some(stage))
+            .timeout_recv_response(Some(stage))
+            .timeout_recv_body(Some(stage))
             .http_status_as_error(false)
             .user_agent(concat!(
                 "rssr/",

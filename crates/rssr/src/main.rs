@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use rssr_core::refresh::{self, Options, Status};
 use rssr_core::store::{Flag, Item, Query};
-use rssr_core::{Fetcher, Result, Store, content, opml};
+use rssr_core::{Fetcher, Result, Store, content, duration, fetch, opml};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -34,6 +34,12 @@ enum Command {
     Refresh {
         #[arg(long, default_value_t = 16)]
         workers: usize,
+        /// Skip feeds fetched more recently than this, e.g. 15m or 6h.
+        #[arg(long, value_name = "DURATION")]
+        max_age: Option<String>,
+        /// Give up on a feed after this long.
+        #[arg(long, value_name = "DURATION")]
+        timeout: Option<String>,
     },
     /// List subscribed feeds.
     Feeds,
@@ -111,8 +117,26 @@ fn run(cli: &Cli) -> Result<ExitCode> {
 
     match &cli.command {
         Command::Import { file } => import(&store, file, cli.json),
-        Command::Refresh { workers } => {
-            do_refresh(&mut store, Options { workers: *workers }, cli.json)
+        Command::Refresh {
+            workers,
+            max_age,
+            timeout,
+        } => {
+            let max_age = max_age.as_deref().map(duration::parse).transpose()?;
+            let timeout = timeout
+                .as_deref()
+                .map(duration::parse)
+                .transpose()?
+                .unwrap_or(fetch::DEFAULT_TIMEOUT);
+            do_refresh(
+                &mut store,
+                Options {
+                    workers: *workers,
+                    max_age,
+                },
+                timeout,
+                cli.json,
+            )
         }
         Command::Feeds => feeds(&store, cli.json),
         Command::List {
@@ -306,8 +330,13 @@ fn import(store: &Store, file: &PathBuf, as_json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn do_refresh(store: &mut Store, options: Options, as_json: bool) -> Result<ExitCode> {
-    let summary = refresh::refresh(store, &Fetcher::new(), options)?;
+fn do_refresh(
+    store: &mut Store,
+    options: Options,
+    timeout: std::time::Duration,
+    as_json: bool,
+) -> Result<ExitCode> {
+    let summary = refresh::refresh(store, &Fetcher::with_timeout(timeout), options)?;
 
     if as_json {
         let feeds: Vec<_> = summary
@@ -323,6 +352,12 @@ fn do_refresh(store: &mut Store, options: Options, as_json: bool) -> Result<Exit
                 Status::NotModified => json!({
                     "url": outcome.url,
                     "status": "not_modified",
+                    "elapsed_ms": outcome.elapsed_ms,
+                }),
+                Status::Skipped { age_secs } => json!({
+                    "url": outcome.url,
+                    "status": "skipped",
+                    "age_secs": age_secs,
                     "elapsed_ms": outcome.elapsed_ms,
                 }),
                 Status::Failed { code, message } => json!({
@@ -345,8 +380,13 @@ fn do_refresh(store: &mut Store, options: Options, as_json: bool) -> Result<Exit
                 eprintln!("{}: {code} {message}", outcome.url);
             }
         }
+        let skipped = summary
+            .outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome.status, Status::Skipped { .. }))
+            .count();
         println!(
-            "{} feeds, {} new items, {} failed",
+            "{} feeds, {} new items, {} failed, {skipped} skipped",
             summary.outcomes.len(),
             summary.new_items,
             summary.failed
