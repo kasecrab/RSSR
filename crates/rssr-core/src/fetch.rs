@@ -5,6 +5,8 @@ use ureq::Agent;
 use crate::{Error, Result};
 
 const MAX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PAGE_BYTES: u64 = 8 * 1024 * 1024;
+const PAGE_ACCEPT: &str = "text/html, application/xhtml+xml;q=0.9, */*;q=0.5";
 const ACCEPT: &str = "application/atom+xml, application/rss+xml, application/feed+json, application/xml;q=0.9, */*;q=0.8";
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -64,6 +66,37 @@ impl Fetcher {
         Fetcher {
             agent: config.new_agent(),
         }
+    }
+
+    /// Fetches an article page rather than a feed: no validators, since the
+    /// body is extracted once and then kept.
+    pub fn get_page(&self, url: &str) -> Result<Vec<u8>> {
+        let mut resp = self
+            .agent
+            .get(url)
+            .header("Accept", PAGE_ACCEPT)
+            .call()
+            .map_err(|e| Error::Http {
+                url: url.to_string(),
+                message: e.to_string(),
+            })?;
+
+        let status = resp.status().as_u16();
+        if !(200..300).contains(&status) {
+            return Err(Error::Status {
+                url: url.to_string(),
+                code: status,
+            });
+        }
+
+        resp.body_mut()
+            .with_config()
+            .limit(MAX_PAGE_BYTES)
+            .read_to_vec()
+            .map_err(|e| Error::Http {
+                url: url.to_string(),
+                message: e.to_string(),
+            })
     }
 
     pub fn get(&self, url: &str, cached: &Validators) -> Result<Fetched> {

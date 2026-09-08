@@ -9,6 +9,7 @@ pub enum Error {
     Http { url: String, message: String },
     Status { url: String, code: u16 },
     Parse { url: String, message: String },
+    Extract { url: String, message: String },
     Opml(String),
     Config(String),
 }
@@ -29,6 +30,7 @@ impl Error {
             Error::Status { code: 410, .. } => "FEED_GONE",
             Error::Status { .. } => "FEED_FETCH_FAILED",
             Error::Parse { .. } => "FEED_PARSE_FAILED",
+            Error::Extract { .. } => "EXTRACT_FAILED",
             Error::Opml(_) => "OPML_INVALID",
             Error::Config(_) => "CONFIG_ERROR",
         }
@@ -45,6 +47,7 @@ impl fmt::Display for Error {
             Error::Http { url, message } => write!(f, "fetch {url}: {message}"),
             Error::Status { url, code } => write!(f, "fetch {url}: http {code}"),
             Error::Parse { url, message } => write!(f, "parse {url}: {message}"),
+            Error::Extract { url, message } => write!(f, "extract {url}: {message}"),
             Error::Opml(e) => write!(f, "opml: {e}"),
             Error::Config(e) => write!(f, "config: {e}"),
         }
