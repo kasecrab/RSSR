@@ -18,7 +18,74 @@ fn strip_tags(html: &str) -> String {
             _ => {}
         }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    unescape(&out)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Feed summaries arrive escaped, often doubly. Leaving `&nbsp;` and `&amp;`
+/// in a snippet wastes the reader's characters and reads as a bug.
+pub fn unescape(text: &str) -> String {
+    if !text.contains('&') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let entity = &rest[1..end];
+        let replacement = match entity {
+            "nbsp" => Some(' '),
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" | "#39" => Some('\''),
+            "hellip" => Some('…'),
+            "mdash" => Some('—'),
+            "ndash" => Some('–'),
+            "rsquo" => Some('\u{2019}'),
+            "lsquo" => Some('\u{2018}'),
+            "ldquo" => Some('\u{201c}'),
+            "rdquo" => Some('\u{201d}'),
+            other => other
+                .strip_prefix('#')
+                .and_then(|digits| match digits.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => digits.parse().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match replacement {
+            Some(ch) => {
+                out.push(ch);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A short plain-text opening, for list output that should not need a second
+/// call just to decide whether an item is worth reading.
+pub fn preview(html: &str, width: usize) -> String {
+    let text = strip_tags(html);
+    match text.char_indices().nth(width) {
+        Some((cut, _)) => format!("{}…", text[..cut].trim_end()),
+        None => text,
+    }
 }
 
 /// Rough token count, used to let a caller budget before pulling article text.
@@ -46,6 +113,20 @@ mod tests {
     #[test]
     fn the_fallback_drops_markup_without_losing_words() {
         assert_eq!(strip_tags("<p>one <b>two</b>  three</p>"), "one two three");
+    }
+
+    #[test]
+    fn entities_do_not_survive_into_a_snippet() {
+        assert_eq!(
+            preview("<p>GPT-6&nbsp;Astra&nbsp;&mdash; Tom &amp; Jerry</p>", 100),
+            "GPT-6 Astra — Tom & Jerry"
+        );
+    }
+
+    #[test]
+    fn numeric_entities_decode_and_unknown_ones_are_left_alone() {
+        assert_eq!(unescape("caf&#233; &#x41;"), "café A");
+        assert_eq!(unescape("Q&A and &notreal; stay"), "Q&A and &notreal; stay");
     }
 
     #[test]
