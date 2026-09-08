@@ -806,20 +806,23 @@ fn read(
         }
     }
 
-    // A budget is shared out evenly, so asking for five items never returns
-    // five times the ceiling.
-    let per_item = match (full, max_tokens) {
-        (true, None) => usize::MAX,
-        (_, Some(budget)) => (budget * 4 / found.len().max(1)).max(200),
-        (false, None) => PREVIEW_CHARS,
+    let bodies: Vec<String> = found
+        .iter()
+        .map(|body| content::to_markdown(&body.content))
+        .collect();
+    let lengths: Vec<usize> = bodies.iter().map(|text| text.chars().count()).collect();
+    let limits = match (full, max_tokens) {
+        (true, None) => vec![usize::MAX; bodies.len()],
+        (_, Some(budget)) => allocate(&lengths, budget * 4),
+        (false, None) => vec![PREVIEW_CHARS; bodies.len()],
     };
 
     if as_json {
         let items: Vec<_> = found
             .iter()
-            .map(|body| {
-                let markdown = content::to_markdown(&body.content);
-                let (text, truncated) = clip(&markdown, per_item);
+            .zip(bodies.iter().zip(&limits))
+            .map(|(body, (markdown, &limit))| {
+                let (text, truncated) = clip(markdown, limit);
                 json!({
                     "id": body.item_id,
                     "feed": body.feed_title,
@@ -839,12 +842,12 @@ fn read(
             .collect();
         print(&json!({ "count": items.len(), "items": items, "missing": missing }));
     } else {
-        for body in &found {
+        for (body, (markdown, &limit)) in found.iter().zip(bodies.iter().zip(&limits)) {
             println!("{}", body.title.as_deref().unwrap_or("(untitled)"));
             if let Some(url) = &body.url {
                 println!("{url}");
             }
-            let (text, truncated) = clip(&content::to_markdown(&body.content), per_item);
+            let (text, truncated) = clip(markdown, limit);
             println!("\n{text}");
             if truncated {
                 println!("\n[truncated; --full or --max-tokens N for more]");
@@ -863,6 +866,36 @@ fn read(
     } else {
         ExitCode::from(PARTIAL)
     })
+}
+
+/// Shares a character budget across items so short ones are served whole and
+/// what they leave unspent goes to the long ones, instead of every item being
+/// cut to the same flat share.
+fn allocate(lengths: &[usize], budget: usize) -> Vec<usize> {
+    let mut limits = vec![0usize; lengths.len()];
+    let mut pending: Vec<usize> = (0..lengths.len()).collect();
+    let mut left = budget;
+
+    while !pending.is_empty() {
+        let share = left / pending.len();
+        let fits: Vec<usize> = pending
+            .iter()
+            .copied()
+            .filter(|&index| lengths[index] <= share)
+            .collect();
+        if fits.is_empty() {
+            for &index in &pending {
+                limits[index] = share;
+            }
+            break;
+        }
+        for &index in &fits {
+            limits[index] = lengths[index];
+            left -= lengths[index];
+        }
+        pending.retain(|index| !fits.contains(index));
+    }
+    limits
 }
 
 fn search(store: &Store, text: &str, query: Query, as_json: bool) -> Result<ExitCode> {
@@ -1084,4 +1117,30 @@ fn print(value: &Value) {
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_default()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_items_are_served_whole_and_leave_the_rest_to_the_long_ones() {
+        let limits = allocate(&[100, 100, 8000, 8000], 4000);
+        assert_eq!(limits[0], 100);
+        assert_eq!(limits[1], 100);
+        assert_eq!(limits[2], 1900);
+        assert_eq!(limits[3], 1900);
+        assert_eq!(limits.iter().sum::<usize>(), 4000);
+    }
+
+    #[test]
+    fn a_budget_that_covers_everything_truncates_nothing() {
+        let limits = allocate(&[100, 200, 300], 4000);
+        assert_eq!(limits, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn items_all_too_long_split_the_budget_evenly() {
+        assert_eq!(allocate(&[9000, 9000], 4000), vec![2000, 2000]);
+    }
 }
