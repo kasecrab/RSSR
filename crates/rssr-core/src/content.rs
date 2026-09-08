@@ -7,6 +7,12 @@ pub fn to_markdown(html: &str) -> String {
     }
 }
 
+/// Tags out, entities decoded, whitespace collapsed. The one place that turns
+/// stored markup into something a reader or a model should see.
+pub fn plain_text(html: &str) -> String {
+    strip_tags(html)
+}
+
 fn strip_tags(html: &str) -> String {
     let mut out = String::with_capacity(html.len());
     let mut depth = 0usize;
@@ -83,7 +89,7 @@ pub fn unescape(text: &str) -> String {
 /// A short plain-text opening, for list output that should not need a second
 /// call just to decide whether an item is worth reading.
 pub fn preview(html: &str, width: usize) -> String {
-    let text = strip_tags(html);
+    let text = plain_text(html);
     match text.char_indices().nth(width) {
         Some((cut, _)) => format!("{}…", text[..cut].trim_end()),
         None => text,

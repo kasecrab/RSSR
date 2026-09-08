@@ -556,7 +556,11 @@ impl Store {
 
         let rows = stmt.query_map(params.as_slice(), |row| {
             let mut item = read_item(row)?;
-            item.snippet = row.get::<_, Option<String>>(9)?;
+            // FTS5 hands back the indexed text as stored, which for a summary
+            // column means raw markup. Same cleaning as `items` does.
+            item.snippet = row
+                .get::<_, Option<String>>(9)?
+                .map(|text| crate::content::plain_text(&text));
             item.score = row.get::<_, Option<f64>>(10)?;
             Ok(item)
         })?;
@@ -948,6 +952,23 @@ mod tests {
         assert_eq!(found[0].id, "a");
         assert!(found[0].score.is_some());
         assert!(found[0].snippet.is_some());
+    }
+
+    #[test]
+    fn search_snippets_are_plain_text_like_list_snippets() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        let mut marked_up = item("a", "Token optimization");
+        marked_up.summary =
+            Some("<p>Context window <b>optimization</b>&nbsp;for agents</p>".into());
+        store.save_items(feed, &[marked_up]).unwrap();
+
+        let snippet = store.search("optimization", &any()).unwrap()[0]
+            .snippet
+            .clone()
+            .unwrap();
+        assert!(!snippet.contains('<'), "{snippet}");
+        assert!(!snippet.contains("&nbsp;"), "{snippet}");
     }
 
     #[test]
