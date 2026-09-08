@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 
+use crate::extract;
 use crate::fetch::{Fetched, Fetcher, Validators};
 use crate::parse::{self, ParsedFeed};
 use crate::store::{Feed, Store};
@@ -40,6 +41,12 @@ pub struct FeedOutcome {
     pub url: String,
     pub status: Status,
     pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Default)]
+pub struct ExtractSummary {
+    pub extracted: usize,
+    pub failed: usize,
 }
 
 #[derive(Debug, Default)]
@@ -139,6 +146,77 @@ pub fn refresh(store: &mut Store, fetcher: &Fetcher, options: Options) -> Result
     })?;
 
     summary.outcomes.sort_by(|a, b| a.url.cmp(&b.url));
+    Ok(summary)
+}
+
+/// Scrapes article pages for feeds marked `full_content`, the way a reader's
+/// "parse full content" toggle does. Runs after the feed pass so it only
+/// visits items that are actually stored, and shares the by-host worker shape
+/// so one site is never hit in parallel.
+pub fn extract_pending(
+    store: &mut Store,
+    fetcher: &Fetcher,
+    per_feed: usize,
+    workers: usize,
+) -> Result<ExtractSummary> {
+    let mut pending: Vec<(String, String)> = Vec::new();
+    for feed in store.feeds()? {
+        if feed.full_content {
+            pending.extend(store.awaiting_extraction(feed.id, per_feed)?);
+        }
+    }
+    if pending.is_empty() {
+        return Ok(ExtractSummary::default());
+    }
+
+    let mut by_host: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    for item in pending {
+        by_host.entry(host_of(&item.1)).or_default().push(item);
+    }
+
+    let queue = Mutex::new(by_host.into_values().collect::<Vec<_>>());
+    let workers = workers.clamp(1, queue.lock().unwrap().len());
+    let (tx, rx) = mpsc::sync_channel::<(String, Result<String>)>(workers * 2);
+
+    let mut summary = ExtractSummary::default();
+
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let queue = &queue;
+            scope.spawn(move || {
+                loop {
+                    let next = queue.lock().unwrap().pop();
+                    let Some(host) = next else { return };
+                    for (id, url) in host {
+                        let article =
+                            extract::from_url(fetcher, &url).map(|article| article.content);
+                        if tx.send((id, article)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+        drop(tx);
+
+        for (id, article) in rx {
+            match article {
+                Ok(content) => {
+                    let title = store.body(&id)?.and_then(|body| body.title);
+                    let content = match title {
+                        Some(title) => extract::drop_repeated_heading(&content, &title),
+                        None => content,
+                    };
+                    store.save_body(&id, &content, "extracted")?;
+                    summary.extracted += 1;
+                }
+                Err(_) => summary.failed += 1,
+            }
+        }
+        Ok::<(), Error>(())
+    })?;
+
     Ok(summary)
 }
 

@@ -52,8 +52,12 @@ enum Command {
     },
     /// Scrape the full article for items whose feed only sent a teaser.
     Extract {
-        #[arg(required = true)]
         ids: Vec<String>,
+        /// Instead of ids, catch up every feed with full content switched on.
+        #[arg(long)]
+        pending: bool,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
     },
     /// List items, newest first.
     List {
@@ -160,7 +164,20 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         Command::Feed { id, full_content } => {
             set_full_content(&store, *id, matches!(full_content, Toggle::On), cli.json)
         }
-        Command::Extract { ids } => extract_items(&store, ids, cli.json),
+        Command::Extract {
+            ids,
+            pending,
+            limit,
+        } => {
+            if *pending {
+                backfill(&mut store, *limit, cli.json)
+            } else if ids.is_empty() {
+                eprintln!("rssr: give item ids, or --pending to catch up marked feeds");
+                Ok(ExitCode::from(2))
+            } else {
+                extract_items(&store, ids, cli.json)
+            }
+        }
         Command::List {
             all,
             feed,
@@ -231,6 +248,21 @@ fn show(items: &[Item]) {
             item.title.as_deref().unwrap_or("(untitled)"),
         );
     }
+}
+
+fn backfill(store: &mut Store, limit: usize, as_json: bool) -> Result<ExitCode> {
+    let fetcher = Fetcher::new();
+    let summary = refresh::extract_pending(store, &fetcher, limit, 16)?;
+    if as_json {
+        print(&json!({ "extracted": summary.extracted, "failed": summary.failed }));
+    } else {
+        println!("{} extracted, {} failed", summary.extracted, summary.failed);
+    }
+    Ok(if summary.failed > 0 && summary.extracted == 0 {
+        ExitCode::from(4)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
 
 fn set_full_content(store: &Store, id: i64, on: bool, as_json: bool) -> Result<ExitCode> {
