@@ -56,7 +56,7 @@ impl Fetcher {
         let stage = timeout.min(Duration::from_secs(6));
         let config = Agent::config_builder()
             .timeout_global(Some(timeout))
-            .timeout_resolve(Some(Duration::from_secs(3)))
+            .timeout_resolve(Some(Duration::from_secs(5)))
             .timeout_connect(Some(stage))
             .timeout_recv_response(Some(stage))
             .timeout_recv_body(Some(stage))
