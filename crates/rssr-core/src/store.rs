@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -735,20 +735,77 @@ fn collapse_duplicates(items: Vec<Item>, query: &Query) -> Vec<Item> {
         return items;
     }
     let mut first_seen: HashMap<String, usize> = HashMap::new();
+    let mut kept_words: Vec<BTreeSet<String>> = Vec::new();
     let mut out: Vec<Item> = Vec::new();
+
     for item in items {
         let keys = dedupe_keys(&item);
-        match keys.iter().find_map(|key| first_seen.get(key).copied()) {
+        let words = title_words(item.title.as_deref().unwrap_or(""));
+
+        let existing = keys
+            .iter()
+            .find_map(|key| first_seen.get(key).copied())
+            .or_else(|| {
+                kept_words
+                    .iter()
+                    .position(|kept| nearly_the_same(kept, &words))
+            });
+
+        match existing {
             Some(index) => out[index].duplicates += 1,
             None => {
                 for key in keys {
                     first_seen.insert(key, out.len());
                 }
+                kept_words.push(words);
                 out.push(item);
             }
         }
     }
     out
+}
+
+/// Words worth comparing: lowercase, no punctuation, and nothing short enough
+/// to be a preposition. Keeping order out of it is deliberate — the same story
+/// gets rewritten headline to headline.
+fn title_words(title: &str) -> BTreeSet<String> {
+    without_publisher(title)
+        .to_lowercase()
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| word.chars().count() > 2)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Aggregators append the source to the headline — "…world models - Bloomberg.com".
+/// That tail is the one part guaranteed to differ between two copies of the same
+/// story, so it comes off before anything is compared. Only a short tail after a
+/// dash or pipe counts, and only when enough headline is left in front of it.
+fn without_publisher(title: &str) -> &str {
+    let title = title.trim();
+    for separator in [" - ", " | ", " — ", " – "] {
+        let Some(at) = title.rfind(separator) else {
+            continue;
+        };
+        let (head, tail) = (&title[..at], &title[at + separator.len()..]);
+        if tail.split_whitespace().count() <= 5 && head.split_whitespace().count() >= 4 {
+            return head;
+        }
+    }
+    title
+}
+
+/// Two headlines describing one story: at least four words in common, and at
+/// least four fifths of all the words they use between them. An aggregator
+/// inserting or dropping a word ("ByteDance *founder* joins…") clears this;
+/// two genuinely different stories about the same subject do not.
+fn nearly_the_same(a: &BTreeSet<String>, b: &BTreeSet<String>) -> bool {
+    let shared = a.intersection(b).count();
+    if shared < 4 {
+        return false;
+    }
+    let total = a.union(b).count();
+    shared * 5 >= total * 4
 }
 
 fn dedupe_keys(item: &Item) -> Vec<String> {
@@ -1014,6 +1071,103 @@ mod tests {
             })
             .unwrap();
         assert_eq!(page.len(), 4);
+    }
+
+    #[test]
+    fn a_reworded_headline_is_recognised_as_the_same_story() {
+        let mut store = Store::open_in_memory().unwrap();
+        let one = add(&store, "https://a.com/feed", None);
+        let two = add(&store, "https://b.com/feed", None);
+        let mut first = item(
+            "a",
+            "ByteDance joins AI elite in race to perfect world models - The Malaysian Reserve",
+        );
+        first.url = Some("https://news.google.com/rss/articles/AAA".into());
+        let mut second = item(
+            "b",
+            "ByteDance founder joins AI elite in race to perfect world models - The Straits Times",
+        );
+        second.url = Some("https://news.google.com/rss/articles/BBB".into());
+        store.save_items(one, &[first]).unwrap();
+        store.save_items(two, &[second]).unwrap();
+
+        let merged = store
+            .items(&Query {
+                dedupe: true,
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].duplicates, 1);
+    }
+
+    #[test]
+    fn a_different_bytedance_story_is_left_alone() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        store
+            .save_items(
+                feed,
+                &[
+                    item(
+                        "a",
+                        "ByteDance joins AI elite in race to perfect world models - Bloomberg.com",
+                    ),
+                    item(
+                        "b",
+                        "ByteDance to Unveil Real-Time 3D Virtual World AI Next Month - Reuters",
+                    ),
+                ],
+            )
+            .unwrap();
+
+        let merged = store
+            .items(&Query {
+                dedupe: true,
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(merged.len(), 2, "two different stories about one company");
+    }
+
+    #[test]
+    fn a_headline_that_merely_contains_a_dash_keeps_its_words() {
+        assert_eq!(
+            without_publisher("Rust 1.90 released"),
+            "Rust 1.90 released"
+        );
+        assert_eq!(
+            without_publisher("ByteDance joins AI elite in race - Bloomberg.com"),
+            "ByteDance joins AI elite in race"
+        );
+        // Too little headline left in front of the dash to be a publisher tag.
+        assert_eq!(
+            without_publisher("Astra - a new model"),
+            "Astra - a new model"
+        );
+    }
+
+    #[test]
+    fn two_releases_of_one_project_are_not_merged() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        store
+            .save_items(
+                feed,
+                &[
+                    item("a", "Linux 7.3-rc2 Released Following Another Busy Week"),
+                    item("b", "Linux 7.4-rc1 Released Following Another Busy Week"),
+                ],
+            )
+            .unwrap();
+
+        let merged = store
+            .items(&Query {
+                dedupe: true,
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(merged.len(), 2, "different releases must stay apart");
     }
 
     #[test]
