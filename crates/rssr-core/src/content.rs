@@ -97,8 +97,10 @@ pub fn preview(html: &str, width: usize) -> String {
 }
 
 /// Rough token count, used to let a caller budget before pulling article text.
+/// Counted in characters, not bytes, so it agrees with the truncation that a
+/// `--max-tokens` budget performs; otherwise accented text overshoots.
 pub fn estimate_tokens(text: &str) -> usize {
-    text.len().div_ceil(4)
+    text.chars().count().div_ceil(4)
 }
 
 #[cfg(test)]
@@ -150,5 +152,10 @@ mod tests {
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("abc"), 1);
         assert_eq!(estimate_tokens("abcde"), 2);
+    }
+
+    #[test]
+    fn accented_text_is_counted_by_character_not_byte() {
+        assert_eq!(estimate_tokens("€€€€"), 1);
     }
 }
