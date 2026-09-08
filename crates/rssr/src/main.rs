@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rssr_core::refresh::{self, Options, Status};
-use rssr_core::store::{Flag, Query};
+use rssr_core::store::{Flag, Item, Query};
 use rssr_core::{Fetcher, Result, Store, opml};
 use serde_json::json;
 
@@ -47,6 +47,12 @@ enum Command {
         #[arg(long, value_name = "NAME")]
         folder: Option<String>,
         #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Full-text search across every stored item.
+    Search {
+        text: String,
+        #[arg(long, default_value_t = 25)]
         limit: usize,
     },
     /// Mark items read, unread, starred or unstarred.
@@ -116,6 +122,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             },
             cli.json,
         ),
+        Command::Search { text, limit } => search(&store, text, *limit, cli.json),
         Command::Mark { flag, ids } => mark(&store, ids, (*flag).into(), cli.json),
     }
 }
@@ -125,37 +132,61 @@ fn list(store: &Store, query: Query, as_json: bool) -> Result<ExitCode> {
     let total = store.count(&query)?;
 
     if as_json {
-        let rows: Vec<_> = items
-            .iter()
-            .map(|item| {
-                json!({
-                    "id": item.id,
-                    "feed": item.feed_title,
-                    "title": item.title,
-                    "url": item.url,
-                    "author": item.author,
-                    "published": item.published,
-                    "read": item.read,
-                    "starred": item.starred,
-                })
-            })
-            .collect();
-        print(&json!({ "count": rows.len(), "total": total, "items": rows }));
+        print(&json!({ "count": items.len(), "total": total, "items": rows(&items) }));
     } else if items.is_empty() {
         println!("nothing to read");
     } else {
-        for item in &items {
-            println!(
-                "{}  {}{}  {:<14} {:<10} {}",
-                item.id,
-                if item.read { " " } else { "*" },
-                if item.starred { "s" } else { " " },
-                truncate(item.feed_title.as_deref().unwrap_or("-"), 14),
-                item.published.as_deref().unwrap_or("").get(..10).unwrap_or(""),
-                item.title.as_deref().unwrap_or("(untitled)"),
-            );
-        }
+        show(&items);
         println!("{} of {total}", items.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn rows(items: &[Item]) -> Vec<serde_json::Value> {
+    items
+        .iter()
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "feed": item.feed_title,
+                "title": item.title,
+                "url": item.url,
+                "author": item.author,
+                "published": item.published,
+                "read": item.read,
+                "starred": item.starred,
+            })
+        })
+        .collect()
+}
+
+fn show(items: &[Item]) {
+    for item in items {
+        println!(
+            "{}  {}{}  {:<14} {:<10} {}",
+            item.id,
+            if item.read { " " } else { "*" },
+            if item.starred { "s" } else { " " },
+            truncate(item.feed_title.as_deref().unwrap_or("-"), 14),
+            item.published
+                .as_deref()
+                .unwrap_or("")
+                .get(..10)
+                .unwrap_or(""),
+            item.title.as_deref().unwrap_or("(untitled)"),
+        );
+    }
+}
+
+fn search(store: &Store, text: &str, limit: usize, as_json: bool) -> Result<ExitCode> {
+    let items = store.search(text, limit)?;
+    if as_json {
+        print(&json!({ "count": items.len(), "items": rows(&items) }));
+    } else if items.is_empty() {
+        println!("no matches for {text:?}");
+    } else {
+        show(&items);
+        println!("{} matches", items.len());
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -8,7 +8,7 @@ use crate::opml::Subscription;
 use crate::parse::ParsedItem;
 use crate::{Error, Result};
 
-const SCHEMA: &str = r#"
+const SCHEMA_V1: &str = r#"
 CREATE TABLE feeds (
     id            INTEGER PRIMARY KEY,
     url           TEXT NOT NULL UNIQUE,
@@ -48,6 +48,37 @@ CREATE TABLE bodies (
     source     TEXT NOT NULL,
     fetched_at TEXT NOT NULL
 );
+"#;
+
+/// The index stores no text of its own; `content=items` points it back at the
+/// table, and the triggers keep the two in step.
+const SCHEMA_V2: &str = r#"
+CREATE VIRTUAL TABLE items_fts USING fts5(
+    title,
+    summary,
+    content = 'items',
+    content_rowid = 'rowid'
+);
+
+CREATE TRIGGER items_fts_insert AFTER INSERT ON items BEGIN
+    INSERT INTO items_fts(rowid, title, summary)
+    VALUES (new.rowid, new.title, new.summary);
+END;
+
+CREATE TRIGGER items_fts_delete AFTER DELETE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, title, summary)
+    VALUES ('delete', old.rowid, old.title, old.summary);
+END;
+
+CREATE TRIGGER items_fts_update AFTER UPDATE ON items BEGIN
+    INSERT INTO items_fts(items_fts, rowid, title, summary)
+    VALUES ('delete', old.rowid, old.title, old.summary);
+    INSERT INTO items_fts(rowid, title, summary)
+    VALUES (new.rowid, new.title, new.summary);
+END;
+
+INSERT INTO items_fts(rowid, title, summary)
+SELECT rowid, title, summary FROM items;
 "#;
 
 #[derive(Debug, Clone)]
@@ -112,6 +143,8 @@ impl Flag {
 
 /// Filters are written as `?n IS NULL OR ...` so one prepared statement
 /// serves every combination instead of pasting SQL together at runtime.
+const LATEST_VERSION: i64 = 2;
+
 const FILTER: &str = "WHERE (?1 = 0 OR items.read = 0)
               AND (?2 IS NULL OR items.feed_id = ?2)
               AND (?3 IS NULL OR feeds.folder = ?3)";
@@ -149,10 +182,13 @@ impl Store {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version == 0 {
-            self.conn.execute_batch(SCHEMA)?;
-            self.conn.execute_batch("PRAGMA user_version = 1")?;
+        for (target, statements) in [(1, SCHEMA_V1), (2, SCHEMA_V2)] {
+            if version < target {
+                self.conn.execute_batch(statements)?;
+            }
         }
+        self.conn
+            .execute_batch(&format!("PRAGMA user_version = {LATEST_VERSION}"))?;
         Ok(())
     }
 
@@ -309,18 +345,7 @@ impl Store {
                 query.folder,
                 query.limit as i64
             ],
-            |row| {
-                Ok(Item {
-                    id: row.get(0)?,
-                    feed_title: row.get(1)?,
-                    title: row.get(2)?,
-                    url: row.get(3)?,
-                    author: row.get(4)?,
-                    published: row.get(5)?,
-                    read: row.get::<_, i64>(6)? != 0,
-                    starred: row.get::<_, i64>(7)? != 0,
-                })
-            },
+            read_item,
         )?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -335,6 +360,22 @@ impl Store {
             params![query.unread_only as i64, query.feed_id, query.folder],
             |row| row.get(0),
         )?)
+    }
+
+    pub fn search(&self, text: &str, limit: usize) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT items.id, feeds.title, items.title, items.url, items.author,
+                    COALESCE(items.published, items.updated, items.seen_at),
+                    items.read, items.starred
+             FROM items_fts
+             JOIN items ON items.rowid = items_fts.rowid
+             JOIN feeds ON feeds.id = items.feed_id
+             WHERE items_fts MATCH ?1
+             ORDER BY bm25(items_fts)
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![text, limit as i64], read_item)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn set_flag(&self, ids: &[String], flag: Flag) -> Result<usize> {
@@ -360,6 +401,19 @@ impl Store {
             .ok_or_else(|| Error::Config("no data directory for this platform".into()))?;
         Ok(dir.join("rssr").join("rssr.db"))
     }
+}
+
+fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
+    Ok(Item {
+        id: row.get(0)?,
+        feed_title: row.get(1)?,
+        title: row.get(2)?,
+        url: row.get(3)?,
+        author: row.get(4)?,
+        published: row.get(5)?,
+        read: row.get::<_, i64>(6)? != 0,
+        starred: row.get::<_, i64>(7)? != 0,
+    })
 }
 
 fn now() -> String {
@@ -440,6 +494,37 @@ mod tests {
             ..Query::default()
         };
         assert_eq!(store.count(&all).unwrap(), 2);
+    }
+
+    #[test]
+    fn search_finds_items_by_title() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        store
+            .save_items(
+                feed,
+                &[item("a", "Async Rust in practice"), item("b", "Go modules")],
+            )
+            .unwrap();
+
+        let found = store.search("rust", 10).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "a");
+    }
+
+    #[test]
+    fn the_index_follows_an_edited_title() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        store
+            .save_items(feed, &[item("a", "Draft heading")])
+            .unwrap();
+        store
+            .save_items(feed, &[item("a", "Published heading")])
+            .unwrap();
+
+        assert!(store.search("draft", 10).unwrap().is_empty());
+        assert_eq!(store.search("published", 10).unwrap().len(), 1);
     }
 
     #[test]
