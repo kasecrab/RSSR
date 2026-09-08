@@ -927,11 +927,25 @@ fn search(store: &Store, text: &str, query: Query, as_json: bool) -> Result<Exit
 }
 
 fn mark(store: &Store, ids: &[String], flag: Flag, as_json: bool) -> Result<ExitCode> {
+    let mut missing = Vec::new();
+    for id in ids {
+        if store.item_url(id)?.is_none() && store.body(id)?.is_none() {
+            missing.push(id.clone());
+        }
+    }
     let changed = store.set_flag(ids, flag)?;
+
     if as_json {
-        print(&json!({ "matched": changed, "requested": ids.len() }));
+        print(&json!({
+            "matched": changed,
+            "requested": ids.len(),
+            "missing": missing,
+        }));
     } else {
         println!("{changed} of {} items updated", ids.len());
+        for id in &missing {
+            eprintln!("no such item: {id}");
+        }
     }
     Ok(if changed == ids.len() {
         ExitCode::SUCCESS
@@ -946,10 +960,11 @@ fn extract_items(store: &Store, ids: &[String], as_json: bool) -> Result<ExitCod
     let fetcher = Fetcher::new();
     let mut results = Vec::new();
     let mut failed = 0;
+    let mut missing = Vec::new();
 
     for id in ids {
         let Some(url) = store.item_url(id)? else {
-            failed += 1;
+            missing.push(id.clone());
             results
                 .push(json!({ "id": id, "ok": false, "error": "no such item, or it has no link" }));
             continue;
@@ -971,7 +986,12 @@ fn extract_items(store: &Store, ids: &[String], as_json: bool) -> Result<ExitCod
     }
 
     if as_json {
-        print(&json!({ "count": results.len(), "failed": failed, "items": results }));
+        print(&json!({
+            "count": results.len(),
+            "failed": failed,
+            "missing": missing,
+            "items": results,
+        }));
     } else {
         for result in &results {
             match result["ok"].as_bool() {
@@ -981,12 +1001,17 @@ fn extract_items(store: &Store, ids: &[String], as_json: bool) -> Result<ExitCod
         }
     }
 
-    Ok(if failed == 0 {
+    // Nothing was fetched for an id that does not exist, so that is a lookup
+    // miss rather than an extraction failure.
+    let scraped = ids.len() - failed - missing.len();
+    Ok(if scraped == ids.len() {
         ExitCode::SUCCESS
-    } else if failed == ids.len() {
-        ExitCode::from(FAILED)
-    } else {
+    } else if scraped > 0 {
         ExitCode::from(PARTIAL)
+    } else if failed == 0 {
+        ExitCode::from(NOT_FOUND)
+    } else {
+        ExitCode::from(FAILED)
     })
 }
 
@@ -1013,13 +1038,21 @@ fn backfill(store: &mut Store, limit: usize, feed: Option<i64>, as_json: bool) -
 }
 
 fn missing_feed(store: &Store, id: i64, as_json: bool) -> Result<ExitCode> {
-    let known: Vec<i64> = store.feeds()?.iter().map(|feed| feed.id).collect();
+    let feeds = store.feeds()?;
     if as_json {
-        print(&json!({ "error": format!("no feed with id {id}"), "known_feeds": known }));
+        let known: Vec<_> = feeds
+            .iter()
+            .map(|feed| json!({ "id": feed.id, "title": feed.title, "url": feed.url }))
+            .collect();
+        print(&json!({
+            "error": format!("no feed with id {id}"),
+            "feed_count": known.len(),
+            "known_feeds": known,
+        }));
     } else {
         eprintln!(
             "no feed with id {id}. `rssr feeds` lists the {} there are",
-            known.len()
+            feeds.len()
         );
     }
     Ok(ExitCode::from(NOT_FOUND))
