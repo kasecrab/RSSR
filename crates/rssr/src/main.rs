@@ -46,6 +46,9 @@ enum Command {
         folder: Option<String>,
         #[arg(long, value_name = "TEXT")]
         title: Option<String>,
+        /// Subscribe even if the first fetch fails.
+        #[arg(long)]
+        force: bool,
     },
     /// Subscribe to every feed in an OPML file.
     Import {
@@ -215,7 +218,12 @@ fn run(cli: &Cli) -> Result<ExitCode> {
     };
 
     match command {
-        Command::Add { url, folder, title } => add(&mut store, url, folder, title, json),
+        Command::Add {
+            url,
+            folder,
+            title,
+            force,
+        } => add(&mut store, url, folder, title, *force, json),
         Command::Import { file, update } => import(&store, file, *update, json),
         Command::Refresh {
             feed,
@@ -403,6 +411,7 @@ fn add(
     url: &str,
     folder: &Option<String>,
     title: &Option<String>,
+    force: bool,
     as_json: bool,
 ) -> Result<ExitCode> {
     let subscription = Subscription {
@@ -429,15 +438,24 @@ fn add(
             _ => None,
         });
 
+    // A feed that cannot be fetched even once is how a dead subscription list
+    // accumulates. Keep it only if the caller insists, or if it was already
+    // subscribed and this was just a bad day.
+    let rolled_back = failure.is_some() && outcome == Upsert::Added && !force;
+    if rolled_back {
+        store.remove_feed(id)?;
+    }
+
     let stored = store.feeds()?.into_iter().find(|feed| feed.id == id);
     let feed_title = stored.and_then(|feed| feed.title);
 
     if as_json {
         print(&json!({
-            "feed": id,
+            "feed": (!rolled_back).then_some(id),
             "url": url,
             "title": feed_title,
-            "added": outcome == Upsert::Added,
+            "added": outcome == Upsert::Added && !rolled_back,
+            "kept": !rolled_back,
             "new_items": new_items,
             "error": failure.as_ref().map(|(_, message)| message),
             "code": failure.as_ref().map(|(code, _)| *code),
@@ -449,7 +467,14 @@ fn add(
                 feed_title.as_deref().unwrap_or(url)
             ),
             (_, None) => println!("feed {id}: already subscribed - {new_items} new items"),
-            (_, Some((code, message))) => eprintln!("feed {id}: {code} {message}"),
+            (_, Some((code, message))) => {
+                eprintln!("{url}: {code} {message}");
+                if rolled_back {
+                    eprintln!(
+                        "not subscribed; pass --force to keep a feed that fails its first fetch"
+                    );
+                }
+            }
         }
     }
     Ok(match failure {
