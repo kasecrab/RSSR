@@ -242,7 +242,10 @@ mod tests {
 
     #[test]
     fn hosts_are_compared_without_scheme_or_credentials() {
-        assert_eq!(host_of("https://user:pw@Example.COM:8443/feed"), "example.com:8443");
+        assert_eq!(
+            host_of("https://user:pw@Example.COM:8443/feed"),
+            "example.com:8443"
+        );
         assert_eq!(host_of("http://example.com/feed"), "example.com");
     }
 }
