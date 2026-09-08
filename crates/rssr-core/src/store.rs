@@ -92,6 +92,9 @@ pub struct Feed {
     pub fetched_at: Option<DateTime<Utc>>,
     /// Scrape each item's page because this feed only publishes a teaser.
     pub full_content: bool,
+    pub status: Option<String>,
+    pub error: Option<String>,
+    pub unread: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -166,6 +169,18 @@ const FILTER: &str = "WHERE (?1 = 0 OR items.read = 0)
               AND (?2 IS NULL OR items.feed_id = ?2)
               AND (?3 IS NULL OR feeds.folder = ?3)";
 
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub feeds: i64,
+    pub folders: i64,
+    pub items: i64,
+    pub unread: i64,
+    pub starred: i64,
+    pub full_text: i64,
+    pub failing: i64,
+    pub last_refresh: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -234,8 +249,13 @@ impl Store {
 
     pub fn feeds(&self) -> Result<Vec<Feed>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, url, title, folder, etag, last_modified, fetched_at, full_content
-             FROM feeds ORDER BY folder IS NULL, folder, title, url",
+            "SELECT feeds.id, feeds.url, feeds.title, feeds.folder, feeds.etag,
+                    feeds.last_modified, feeds.fetched_at, feeds.full_content,
+                    feeds.status, feeds.error,
+                    COUNT(items.id) FILTER (WHERE items.read = 0)
+             FROM feeds LEFT JOIN items ON items.feed_id = feeds.id
+             GROUP BY feeds.id
+             ORDER BY feeds.folder IS NULL, feeds.folder, feeds.title, feeds.url",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok(Feed {
@@ -247,6 +267,9 @@ impl Store {
                 last_modified: row.get(5)?,
                 fetched_at: row.get::<_, Option<String>>(6)?.and_then(parse_stamp),
                 full_content: row.get::<_, i64>(7)? != 0,
+                status: row.get(8)?,
+                error: row.get(9)?,
+                unread: row.get(10)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -488,6 +511,34 @@ impl Store {
         Ok(changed)
     }
 
+    /// One round trip for everything the status view needs.
+    pub fn stats(&self) -> Result<Stats> {
+        Ok(self.conn.query_row(
+            "SELECT
+                 (SELECT COUNT(*) FROM feeds),
+                 (SELECT COUNT(DISTINCT folder) FROM feeds WHERE folder IS NOT NULL),
+                 (SELECT COUNT(*) FROM items),
+                 (SELECT COUNT(*) FROM items WHERE read = 0),
+                 (SELECT COUNT(*) FROM items WHERE starred = 1),
+                 (SELECT COUNT(*) FROM bodies WHERE source = 'extracted'),
+                 (SELECT COUNT(*) FROM feeds WHERE status = 'error'),
+                 (SELECT MAX(fetched_at) FROM feeds)",
+            [],
+            |row| {
+                Ok(Stats {
+                    feeds: row.get(0)?,
+                    folders: row.get(1)?,
+                    items: row.get(2)?,
+                    unread: row.get(3)?,
+                    starred: row.get(4)?,
+                    full_text: row.get(5)?,
+                    failing: row.get(6)?,
+                    last_refresh: row.get(7)?,
+                })
+            },
+        )?)
+    }
+
     pub fn unread_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -578,6 +629,33 @@ mod tests {
         let second = vec![item("b", "Two"), item("c", "Three")];
         assert_eq!(store.save_items(feed, &second).unwrap(), 1);
         assert_eq!(store.unread_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn stats_describe_an_empty_database_without_failing() {
+        let store = Store::open_in_memory().unwrap();
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.feeds, 0);
+        assert_eq!(stats.items, 0);
+        assert_eq!(stats.last_refresh, None);
+    }
+
+    #[test]
+    fn stats_count_what_is_there() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store
+            .upsert_feed(&sub("https://a.com/feed", Some("Tech")))
+            .unwrap();
+        store
+            .save_items(feed, &[item("a", "One"), item("b", "Two")])
+            .unwrap();
+        store.set_flag(&["a".to_string()], Flag::Read).unwrap();
+        store.save_body("b", "<p>full</p>", "extracted").unwrap();
+
+        let stats = store.stats().unwrap();
+        assert_eq!((stats.feeds, stats.folders), (1, 1));
+        assert_eq!((stats.items, stats.unread), (2, 1));
+        assert_eq!(stats.full_text, 1);
     }
 
     #[test]

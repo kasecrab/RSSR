@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use rssr_core::refresh::{self, Options, Status};
-use rssr_core::store::{Flag, Item, Query};
+use rssr_core::store::{Flag, Item, Query, Stats};
 use rssr_core::{Fetcher, Result, Store, content, duration, extract, fetch, opml};
 use serde_json::json;
 
@@ -23,7 +23,7 @@ struct Cli {
     json: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -45,7 +45,11 @@ enum Command {
         extract: bool,
     },
     /// List subscribed feeds.
-    Feeds,
+    Feeds {
+        /// Only the feeds whose last fetch failed, with the reason.
+        #[arg(long)]
+        failing: bool,
+    },
     /// Change a feed's settings.
     Feed {
         id: i64,
@@ -140,7 +144,11 @@ fn run(cli: &Cli) -> Result<ExitCode> {
     };
     let mut store = Store::open(&path)?;
 
-    match &cli.command {
+    let Some(command) = &cli.command else {
+        return status(&store, &path, cli.json);
+    };
+
+    match command {
         Command::Import { file } => import(&store, file, cli.json),
         Command::Refresh {
             workers,
@@ -165,7 +173,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                 cli.json,
             )
         }
-        Command::Feeds => feeds(&store, cli.json),
+        Command::Feeds { failing } => feeds(&store, *failing, cli.json),
         Command::Feed { id, full_content } => {
             set_full_content(&store, *id, matches!(full_content, Toggle::On), cli.json)
         }
@@ -211,12 +219,31 @@ fn list(store: &Store, query: Query, as_json: bool) -> Result<ExitCode> {
     if as_json {
         print(&json!({ "count": items.len(), "total": total, "items": rows(&items) }));
     } else if items.is_empty() {
-        println!("nothing to read");
+        println!("no items match. {}", why_empty(store, &query)?);
     } else {
         show(&items);
         println!("{} of {total}", items.len());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// An empty list has several causes and an agent cannot guess which.
+fn why_empty(store: &Store, query: &Query) -> Result<String> {
+    let stats = store.stats()?;
+    Ok(if stats.feeds == 0 {
+        "no feeds subscribed - run `rssr import <file.opml>`".into()
+    } else if stats.items == 0 {
+        "feeds are subscribed but never fetched - run `rssr refresh`".into()
+    } else if query.unread_only && stats.unread == 0 {
+        format!(
+            "all {} items are read - `rssr list --all` shows them",
+            stats.items
+        )
+    } else if query.feed_id.is_some() || query.folder.is_some() {
+        format!("the filter matched none of {} items", stats.items)
+    } else {
+        format!("{} items stored, none unread", stats.items)
+    })
 }
 
 fn rows(items: &[Item]) -> Vec<serde_json::Value> {
@@ -401,7 +428,8 @@ fn search(store: &Store, text: &str, limit: usize, as_json: bool) -> Result<Exit
     if as_json {
         print(&json!({ "count": items.len(), "items": rows(&items) }));
     } else if items.is_empty() {
-        println!("no matches for {text:?}");
+        let stats = store.stats()?;
+        println!("no matches for {text:?} in {} items", stats.items);
     } else {
         show(&items);
         println!("{} matches", items.len());
@@ -429,6 +457,113 @@ fn truncate(value: &str, width: usize) -> String {
         .nth(width.saturating_sub(1))
         .map_or(value.len(), |(index, _)| index);
     format!("{}…", &value[..cut])
+}
+
+/// What a bare `rssr` prints: where the database is, what is in it, and the
+/// commands worth running next. An agent should not need a manual to start.
+fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
+    let stats = store.stats()?;
+    let recent = one_per_feed(
+        store.items(&Query {
+            limit: 60,
+            ..Query::default()
+        })?,
+        8,
+    );
+    let next = next_steps(&stats);
+
+    if as_json {
+        print(&json!({
+            "db": db.display().to_string(),
+            "feeds": stats.feeds,
+            "folders": stats.folders,
+            "items": stats.items,
+            "unread": stats.unread,
+            "starred": stats.starred,
+            "full_text": stats.full_text,
+            "failing_feeds": stats.failing,
+            "last_refresh": stats.last_refresh,
+            "recent": rows(&recent),
+            "next": next,
+        }));
+    } else {
+        println!("db: {}", db.display());
+        if stats.feeds == 0 {
+            println!("feeds: none");
+        } else {
+            println!("feeds: {} in {} folders", stats.feeds, stats.folders);
+        }
+        println!("unread: {} of {} items", stats.unread, stats.items);
+        if stats.starred > 0 || stats.full_text > 0 {
+            println!(
+                "starred: {}   full text: {}",
+                stats.starred, stats.full_text
+            );
+        }
+        if stats.failing > 0 {
+            println!(
+                "failing feeds: {} (`rssr feeds --failing` for why)",
+                stats.failing
+            );
+        }
+        match &stats.last_refresh {
+            Some(at) => println!("last refresh: {at}"),
+            None => println!("last refresh: never"),
+        }
+        if !recent.is_empty() {
+            println!();
+            show(&recent);
+        }
+        println!();
+        println!("next:");
+        for step in &next {
+            println!("  {step}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A burst from one busy feed would otherwise fill the whole sample and tell
+/// the reader nothing about the rest of their subscriptions.
+fn one_per_feed(items: Vec<Item>, keep: usize) -> Vec<Item> {
+    let mut seen = std::collections::HashSet::new();
+    let mut picked: Vec<Item> = items
+        .iter()
+        .filter(|item| seen.insert(item.feed_title.clone()))
+        .take(keep)
+        .cloned()
+        .collect();
+    if picked.len() < keep {
+        for item in items {
+            if picked.len() >= keep {
+                break;
+            }
+            if !picked.iter().any(|kept| kept.id == item.id) {
+                picked.push(item);
+            }
+        }
+    }
+    picked
+}
+
+fn next_steps(stats: &Stats) -> Vec<&'static str> {
+    if stats.feeds == 0 {
+        vec!["rssr import <file.opml> - subscribe to every feed in an OPML export"]
+    } else if stats.items == 0 {
+        vec!["rssr refresh - fetch items for the feeds already subscribed"]
+    } else if stats.unread == 0 {
+        vec![
+            "rssr refresh - look for new items",
+            "rssr list --all - items already read",
+        ]
+    } else {
+        vec![
+            "rssr list --limit 20 - newest unread items",
+            "rssr read <id> - one item as text",
+            "rssr search <text> - full-text search",
+            "rssr mark read <id> - reading never marks anything read on its own",
+        ]
+    }
 }
 
 fn import(store: &Store, file: &PathBuf, as_json: bool) -> Result<ExitCode> {
@@ -529,8 +664,11 @@ fn do_refresh(
     })
 }
 
-fn feeds(store: &Store, as_json: bool) -> Result<ExitCode> {
-    let feeds = store.feeds()?;
+fn feeds(store: &Store, failing_only: bool, as_json: bool) -> Result<ExitCode> {
+    let mut feeds = store.feeds()?;
+    if failing_only {
+        feeds.retain(|feed| feed.status.as_deref() == Some("error"));
+    }
     if as_json {
         let rows: Vec<_> = feeds
             .iter()
@@ -540,10 +678,18 @@ fn feeds(store: &Store, as_json: bool) -> Result<ExitCode> {
                     "url": feed.url,
                     "title": feed.title,
                     "folder": feed.folder,
+                    "unread": feed.unread,
+                    "status": feed.status,
+                    "error": feed.error,
+                    "full_content": feed.full_content,
                 })
             })
             .collect();
         print(&json!({ "count": rows.len(), "feeds": rows }));
+    } else if feeds.is_empty() && failing_only {
+        println!("no failing feeds");
+    } else if feeds.is_empty() {
+        println!("no feeds subscribed - run `rssr import <file.opml>`");
     } else {
         let mut current: Option<&str> = None;
         for feed in &feeds {
@@ -556,11 +702,16 @@ fn feeds(store: &Store, as_json: bool) -> Result<ExitCode> {
                 current = Some(folder);
             }
             println!(
-                "  {:>3}  {:<28}  {}",
+                "  {:>3}  {:<28}  {:>5} unread  {:<12}  {}",
                 feed.id,
                 truncate(feed.title.as_deref().unwrap_or("(untitled)"), 28),
+                feed.unread,
+                feed.status.as_deref().unwrap_or("never fetched"),
                 feed.url
             );
+            if let Some(error) = &feed.error {
+                println!("       {error}");
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
