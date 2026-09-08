@@ -40,6 +40,9 @@ enum Command {
         /// Give up on a feed after this long.
         #[arg(long, value_name = "DURATION")]
         timeout: Option<String>,
+        /// Also scrape article pages for feeds with full content switched on.
+        #[arg(long)]
+        extract: bool,
     },
     /// List subscribed feeds.
     Feeds,
@@ -143,6 +146,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             workers,
             max_age,
             timeout,
+            extract,
         } => {
             let max_age = max_age.as_deref().map(duration::parse).transpose()?;
             let timeout = timeout
@@ -157,6 +161,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
                     max_age,
                 },
                 timeout,
+                *extract,
                 cli.json,
             )
         }
@@ -448,9 +453,16 @@ fn do_refresh(
     store: &mut Store,
     options: Options,
     timeout: std::time::Duration,
+    with_extract: bool,
     as_json: bool,
 ) -> Result<ExitCode> {
-    let summary = refresh::refresh(store, &Fetcher::with_timeout(timeout), options)?;
+    let fetcher = Fetcher::with_timeout(timeout);
+    let summary = refresh::refresh(store, &fetcher, options)?;
+    let extracted = if with_extract {
+        refresh::extract_pending(store, &fetcher, 25, options.workers)?
+    } else {
+        Default::default()
+    };
 
     if as_json {
         let feeds: Vec<_> = summary
@@ -482,6 +494,8 @@ fn do_refresh(
             "feeds": feeds,
             "new_items": summary.new_items,
             "failed": summary.failed,
+            "extracted": extracted.extracted,
+            "extract_failed": extracted.failed,
         }));
     } else {
         for outcome in &summary.outcomes {
@@ -500,6 +514,12 @@ fn do_refresh(
             summary.new_items,
             summary.failed
         );
+        if with_extract {
+            println!(
+                "{} articles scraped, {} failed",
+                extracted.extracted, extracted.failed
+            );
+        }
     }
 
     Ok(match summary.failed {
