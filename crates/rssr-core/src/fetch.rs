@@ -159,14 +159,21 @@ mod tests {
         assert!(matches!(fetched, Fetched::NotModified));
 
         let request = rx.recv().unwrap();
-        assert!(request.contains("if-none-match: \"abc\"") || request.contains("If-None-Match: \"abc\""));
+        assert!(
+            request.contains("if-none-match: \"abc\"")
+                || request.contains("If-None-Match: \"abc\"")
+        );
         assert!(request.to_lowercase().contains("if-modified-since:"));
     }
 
     #[test]
     fn a_server_error_is_reported_with_its_status() {
-        let (url, _rx) = serve("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-        let err = Fetcher::new().get(&url, &Validators::default()).unwrap_err();
+        let (url, _rx) = serve(
+            "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let err = Fetcher::new()
+            .get(&url, &Validators::default())
+            .unwrap_err();
         assert!(matches!(err, Error::Status { code: 503, .. }));
     }
 }
