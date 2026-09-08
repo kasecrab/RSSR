@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
 dirs = "7.0.0"
 feed-rs = "2.4.0"
 quick-xml = "0.42.0"

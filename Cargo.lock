@@ -875,6 +875,7 @@ dependencies = [
 name = "rssr-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "dirs",
  "feed-rs",
  "quick-xml 0.42.0",
