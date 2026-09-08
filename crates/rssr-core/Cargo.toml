@@ -1,0 +1,15 @@
+[package]
+name = "rssr-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dirs = "7.0.0"
+feed-rs = "2.4.0"
+quick-xml = "0.42.0"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { workspace = true, features = ["std"] }
+serde_json = { workspace = true, features = ["std"] }
+sha2 = "0.11.0"
+ureq = { version = "3.4.1", default-features = false, features = ["rustls", "gzip"] }
