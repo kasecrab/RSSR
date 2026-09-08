@@ -1,4 +1,5 @@
 mod error;
+pub mod identity;
 pub mod opml;
 pub mod store;
 
