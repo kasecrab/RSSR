@@ -200,7 +200,10 @@ fn main() -> ExitCode {
                 print(&json!({ "error": e.to_string(), "code": e.code() }));
             }
             eprintln!("rssr: {e}");
-            ExitCode::from(1)
+            match e {
+                rssr_core::Error::Usage(_) => ExitCode::from(USAGE),
+                _ => ExitCode::from(1),
+            }
         }
     }
 }
@@ -1108,7 +1111,11 @@ fn parse_since(value: &str) -> Result<DateTime<Utc>> {
     if let Ok(at) = DateTime::parse_from_rfc3339(value) {
         return Ok(at.with_timezone(&Utc));
     }
-    let ago = duration::parse(value)?;
+    let ago = duration::parse(value).map_err(|_| {
+        rssr_core::Error::Usage(format!(
+            "cannot read {value:?} as a time; use 24h, 7d, or 2026-09-08"
+        ))
+    })?;
     Ok(Utc::now() - chrono::Duration::from_std(ago).unwrap_or_default())
 }
 

@@ -12,14 +12,18 @@ pub fn parse(value: &str) -> Result<Duration> {
 
     let amount: u64 = digits
         .parse()
-        .map_err(|_| Error::Config(format!("not a duration: {value}")))?;
+        .map_err(|_| Error::Usage(format!("not a duration: {value:?}")))?;
 
     let seconds = match unit {
         "s" => 1,
         "m" => 60,
         "h" => 60 * 60,
         "d" => 24 * 60 * 60,
-        other => return Err(Error::Config(format!("unknown duration unit: {other}"))),
+        other => {
+            return Err(Error::Usage(format!(
+                "unknown duration unit {other:?}; use s, m, h or d"
+            )));
+        }
     };
 
     Ok(Duration::from_secs(amount * seconds))

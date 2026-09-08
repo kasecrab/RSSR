@@ -6,12 +6,26 @@ pub enum Error {
     Db(rusqlite::Error),
     Json(serde_json::Error),
     Xml(quick_xml::Error),
-    Http { url: String, message: String },
-    Status { url: String, code: u16 },
-    Parse { url: String, message: String },
-    Extract { url: String, message: String },
+    Http {
+        url: String,
+        message: String,
+    },
+    Status {
+        url: String,
+        code: u16,
+    },
+    Parse {
+        url: String,
+        message: String,
+    },
+    Extract {
+        url: String,
+        message: String,
+    },
     Opml(String),
     Config(String),
+    /// A malformed argument. The caller made the mistake, not the network.
+    Usage(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -33,6 +47,7 @@ impl Error {
             Error::Extract { .. } => "EXTRACT_FAILED",
             Error::Opml(_) => "OPML_INVALID",
             Error::Config(_) => "CONFIG_ERROR",
+            Error::Usage(_) => "USAGE_ERROR",
         }
     }
 }
@@ -50,6 +65,7 @@ impl fmt::Display for Error {
             Error::Extract { url, message } => write!(f, "extract {url}: {message}"),
             Error::Opml(e) => write!(f, "opml: {e}"),
             Error::Config(e) => write!(f, "config: {e}"),
+            Error::Usage(e) => write!(f, "{e}"),
         }
     }
 }
