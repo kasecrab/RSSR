@@ -342,31 +342,26 @@ fn do_refresh(
         let feeds: Vec<_> = summary
             .outcomes
             .iter()
-            .map(|outcome| match &outcome.status {
-                Status::Updated { new_items } => json!({
+            .map(|outcome| {
+                let (status, new_items, age_secs, code, message) = match &outcome.status {
+                    Status::Updated { new_items } => {
+                        ("updated", Some(*new_items), None, None, None)
+                    }
+                    Status::NotModified => ("not_modified", None, None, None, None),
+                    Status::Skipped { age_secs } => ("skipped", None, Some(*age_secs), None, None),
+                    Status::Failed { code, message } => {
+                        ("failed", None, None, Some(*code), Some(message.as_str()))
+                    }
+                };
+                json!({
                     "url": outcome.url,
-                    "status": "updated",
+                    "status": status,
+                    "elapsed_ms": outcome.elapsed_ms,
                     "new_items": new_items,
-                    "elapsed_ms": outcome.elapsed_ms,
-                }),
-                Status::NotModified => json!({
-                    "url": outcome.url,
-                    "status": "not_modified",
-                    "elapsed_ms": outcome.elapsed_ms,
-                }),
-                Status::Skipped { age_secs } => json!({
-                    "url": outcome.url,
-                    "status": "skipped",
                     "age_secs": age_secs,
-                    "elapsed_ms": outcome.elapsed_ms,
-                }),
-                Status::Failed { code, message } => json!({
-                    "url": outcome.url,
-                    "status": "failed",
                     "code": code,
                     "message": message,
-                    "elapsed_ms": outcome.elapsed_ms,
-                }),
+                })
             })
             .collect();
         print(&json!({
