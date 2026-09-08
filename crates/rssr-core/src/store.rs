@@ -60,6 +60,62 @@ pub struct Feed {
     pub last_modified: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct Item {
+    pub id: String,
+    pub feed_title: Option<String>,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub author: Option<String>,
+    pub published: Option<String>,
+    pub read: bool,
+    pub starred: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Query {
+    pub unread_only: bool,
+    pub feed_id: Option<i64>,
+    pub folder: Option<String>,
+    pub limit: usize,
+}
+
+impl Default for Query {
+    fn default() -> Self {
+        Query {
+            unread_only: true,
+            feed_id: None,
+            folder: None,
+            limit: 50,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flag {
+    Read,
+    Unread,
+    Star,
+    Unstar,
+}
+
+impl Flag {
+    fn assignment(self) -> &'static str {
+        match self {
+            Flag::Read => "read = 1",
+            Flag::Unread => "read = 0",
+            Flag::Star => "starred = 1",
+            Flag::Unstar => "starred = 0",
+        }
+    }
+}
+
+/// Filters are written as `?n IS NULL OR ...` so one prepared statement
+/// serves every combination instead of pasting SQL together at runtime.
+const FILTER: &str = "WHERE (?1 = 0 OR items.read = 0)
+              AND (?2 IS NULL OR items.feed_id = ?2)
+              AND (?3 IS NULL OR feeds.folder = ?3)";
+
 pub struct Store {
     conn: Connection,
 }
@@ -235,6 +291,62 @@ impl Store {
         Ok(new)
     }
 
+    pub fn items(&self, query: &Query) -> Result<Vec<Item>> {
+        let sql = format!(
+            "SELECT items.id, feeds.title, items.title, items.url, items.author,
+                    COALESCE(items.published, items.updated, items.seen_at) AS at,
+                    items.read, items.starred
+             FROM items JOIN feeds ON feeds.id = items.feed_id
+             {FILTER}
+             ORDER BY at DESC
+             LIMIT ?4"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params![
+                query.unread_only as i64,
+                query.feed_id,
+                query.folder,
+                query.limit as i64
+            ],
+            |row| {
+                Ok(Item {
+                    id: row.get(0)?,
+                    feed_title: row.get(1)?,
+                    title: row.get(2)?,
+                    url: row.get(3)?,
+                    author: row.get(4)?,
+                    published: row.get(5)?,
+                    read: row.get::<_, i64>(6)? != 0,
+                    starred: row.get::<_, i64>(7)? != 0,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// How many items the query matches in total, so a caller never has to
+    /// page just to learn the size of the result.
+    pub fn count(&self, query: &Query) -> Result<i64> {
+        let sql =
+            format!("SELECT COUNT(*) FROM items JOIN feeds ON feeds.id = items.feed_id {FILTER}");
+        Ok(self.conn.query_row(
+            &sql,
+            params![query.unread_only as i64, query.feed_id, query.folder],
+            |row| row.get(0),
+        )?)
+    }
+
+    pub fn set_flag(&self, ids: &[String], flag: Flag) -> Result<usize> {
+        let sql = format!("UPDATE items SET {} WHERE id = ?1", flag.assignment());
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut changed = 0;
+        for id in ids {
+            changed += stmt.execute([id])?;
+        }
+        Ok(changed)
+    }
+
     pub fn unread_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -306,6 +418,61 @@ mod tests {
         let second = vec![item("b", "Two"), item("c", "Three")];
         assert_eq!(store.save_items(feed, &second).unwrap(), 1);
         assert_eq!(store.unread_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn listing_defaults_to_unread_and_reports_the_total() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store
+            .upsert_feed(&sub("https://a.com/feed", Some("Tech")))
+            .unwrap();
+        store
+            .save_items(feed, &[item("a", "One"), item("b", "Two")])
+            .unwrap();
+        store.set_flag(&["a".to_string()], Flag::Read).unwrap();
+
+        let query = Query::default();
+        assert_eq!(store.count(&query).unwrap(), 1);
+        assert_eq!(store.items(&query).unwrap()[0].id, "b");
+
+        let all = Query {
+            unread_only: false,
+            ..Query::default()
+        };
+        assert_eq!(store.count(&all).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_folder_filter_only_matches_its_own_feeds() {
+        let mut store = Store::open_in_memory().unwrap();
+        let tech = store
+            .upsert_feed(&sub("https://a.com/feed", Some("Tech")))
+            .unwrap();
+        let news = store
+            .upsert_feed(&sub("https://b.com/feed", Some("News")))
+            .unwrap();
+        store.save_items(tech, &[item("a", "One")]).unwrap();
+        store.save_items(news, &[item("b", "Two")]).unwrap();
+
+        let query = Query {
+            folder: Some("Tech".into()),
+            ..Query::default()
+        };
+        let found = store.items(&query).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "a");
+    }
+
+    #[test]
+    fn marking_something_twice_changes_nothing_the_second_time() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        store.save_items(feed, &[item("a", "One")]).unwrap();
+
+        let ids = vec!["a".to_string()];
+        assert_eq!(store.set_flag(&ids, Flag::Read).unwrap(), 1);
+        store.set_flag(&ids, Flag::Read).unwrap();
+        assert_eq!(store.unread_count().unwrap(), 0);
     }
 
     #[test]
