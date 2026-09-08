@@ -1178,6 +1178,7 @@ dependencies = [
 name = "rssr"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "rssr-core",
  "serde_json",

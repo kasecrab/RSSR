@@ -1,24 +1,35 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::time::Duration;
 
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use rssr_core::opml::Subscription;
 use rssr_core::refresh::{self, Options, Status};
-use rssr_core::store::{Flag, Item, Query, Stats};
+use rssr_core::store::{Flag, Item, Query, Stats, Upsert};
 use rssr_core::{Fetcher, Result, Store, content, duration, extract, fetch, opml};
-use serde_json::json;
+use serde_json::{Value, json};
+
+/// Exit codes, used the same way by every subcommand:
+///   0 done · 1 nothing by that name · 2 bad usage · 3 partly failed · 4 all failed
+const NOT_FOUND: u8 = 1;
+const USAGE: u8 = 2;
+const PARTIAL: u8 = 3;
+const FAILED: u8 = 4;
 
 #[derive(Parser)]
 #[command(
     name = "rssr",
     version,
-    about = "Read RSS and Atom feeds from the shell"
+    about = "Read RSS and Atom feeds from the shell",
+    after_help = "Exit codes: 0 done, 1 nothing by that name, 2 bad usage, 3 partly failed, 4 all failed."
 )]
 struct Cli {
     /// Database to use instead of the default location.
     #[arg(long, global = true, value_name = "PATH")]
     db: Option<PathBuf>,
 
-    /// Print JSON instead of a table.
+    /// Print JSON instead of a table. This is the interface to script against.
     #[arg(long, global = true)]
     json: bool,
 
@@ -28,10 +39,25 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Subscribe to a single feed and fetch it.
+    Add {
+        url: String,
+        #[arg(long, value_name = "NAME")]
+        folder: Option<String>,
+        #[arg(long, value_name = "TEXT")]
+        title: Option<String>,
+    },
     /// Subscribe to every feed in an OPML file.
-    Import { file: PathBuf },
-    /// Fetch new items for every subscribed feed.
+    Import {
+        file: PathBuf,
+        /// Let the file's titles and folders replace the ones already stored.
+        #[arg(long)]
+        update: bool,
+    },
+    /// Fetch new items.
     Refresh {
+        #[arg(long, value_name = "ID")]
+        feed: Option<i64>,
         #[arg(long, default_value_t = 16)]
         workers: usize,
         /// Skip feeds fetched more recently than this, e.g. 15m or 6h.
@@ -49,46 +75,71 @@ enum Command {
         /// Only the feeds whose last fetch failed, with the reason.
         #[arg(long)]
         failing: bool,
+        #[arg(long, value_name = "NAME")]
+        folder: Option<String>,
     },
-    /// Change a feed's settings.
+    /// Change or remove one feed.
     Feed {
         id: i64,
         /// Scrape each item's page because this feed only publishes a teaser.
         #[arg(long, value_name = "on|off")]
-        full_content: Toggle,
-    },
-    /// Scrape the full article for items whose feed only sent a teaser.
-    Extract {
-        ids: Vec<String>,
-        /// Instead of ids, catch up every feed with full content switched on.
+        full_content: Option<Toggle>,
+        #[arg(long, value_name = "TEXT")]
+        rename: Option<String>,
+        #[arg(long, value_name = "NAME")]
+        folder: Option<String>,
+        /// Unsubscribe and delete every item stored for it.
         #[arg(long)]
-        pending: bool,
-        #[arg(long, default_value_t = 25)]
-        limit: usize,
+        remove: bool,
     },
     /// List items, newest first.
     List {
         /// Include items already read.
         #[arg(long)]
         all: bool,
+        #[arg(long)]
+        starred: bool,
         #[arg(long, value_name = "ID")]
         feed: Option<i64>,
         #[arg(long, value_name = "NAME")]
         folder: Option<String>,
+        /// Only items this recent: a duration like 24h, or a date like 2026-09-08.
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// At most this many items from any one feed.
+        #[arg(long, value_name = "N")]
+        per_feed: Option<usize>,
+        /// Include this many characters of each item's text.
+        #[arg(long, value_name = "CHARS")]
+        snippet: Option<usize>,
+        /// Collapse the same story arriving from several feeds into one row.
+        #[arg(long)]
+        dedupe: bool,
     },
-    /// Print one or more items as text. Reading never marks anything read.
+    /// Print items as text. Reading never marks anything read.
     Read {
         #[arg(required = true)]
         ids: Vec<String>,
-        /// Print the whole body instead of the first few thousand characters.
+        /// Print whole bodies instead of an opening.
         #[arg(long)]
         full: bool,
+        /// Rough ceiling on the tokens returned, shared across the items asked for.
+        #[arg(long, value_name = "N")]
+        max_tokens: Option<usize>,
     },
-    /// Full-text search across every stored item.
+    /// Full-text search. Terms are AND-ed; "quoted phrases" and prefix* work.
     Search {
         text: String,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, value_name = "ID")]
+        feed: Option<i64>,
+        #[arg(long, value_name = "NAME")]
+        folder: Option<String>,
+        #[arg(long, value_name = "WHEN")]
+        since: Option<String>,
         #[arg(long, default_value_t = 25)]
         limit: usize,
     },
@@ -98,6 +149,17 @@ enum Command {
         flag: MarkFlag,
         #[arg(required = true)]
         ids: Vec<String>,
+    },
+    /// Scrape the full article for items whose feed only sent a teaser.
+    Extract {
+        ids: Vec<String>,
+        /// Instead of ids, catch up feeds with full content switched on.
+        #[arg(long)]
+        pending: bool,
+        #[arg(long, value_name = "ID")]
+        feed: Option<i64>,
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
     },
 }
 
@@ -131,6 +193,9 @@ fn main() -> ExitCode {
     match run(&cli) {
         Ok(code) => code,
         Err(e) => {
+            if cli.json {
+                print(&json!({ "error": e.to_string(), "code": e.code() }));
+            }
             eprintln!("rssr: {e}");
             ExitCode::from(1)
         }
@@ -143,333 +208,122 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         None => Store::default_path()?,
     };
     let mut store = Store::open(&path)?;
+    let json = cli.json;
 
     let Some(command) = &cli.command else {
-        return status(&store, &path, cli.json);
+        return status(&store, &path, json);
     };
 
     match command {
-        Command::Import { file } => import(&store, file, cli.json),
+        Command::Add { url, folder, title } => add(&mut store, url, folder, title, json),
+        Command::Import { file, update } => import(&store, file, *update, json),
         Command::Refresh {
+            feed,
             workers,
             max_age,
             timeout,
             extract,
         } => {
-            let max_age = max_age.as_deref().map(duration::parse).transpose()?;
+            if let Some(id) = feed
+                && !store.feed_exists(*id)?
+            {
+                return missing_feed(&store, *id, json);
+            }
+            let options = Options {
+                workers: *workers,
+                max_age: max_age.as_deref().map(duration::parse).transpose()?,
+                only_feed: *feed,
+            };
             let timeout = timeout
                 .as_deref()
                 .map(duration::parse)
                 .transpose()?
                 .unwrap_or(fetch::DEFAULT_TIMEOUT);
-            do_refresh(
-                &mut store,
-                Options {
-                    workers: *workers,
-                    max_age,
-                },
-                timeout,
-                *extract,
-                cli.json,
-            )
+            do_refresh(&mut store, options, timeout, *extract, json)
         }
-        Command::Feeds { failing } => feeds(&store, *failing, cli.json),
-        Command::Feed { id, full_content } => {
-            set_full_content(&store, *id, matches!(full_content, Toggle::On), cli.json)
-        }
-        Command::Extract {
-            ids,
-            pending,
-            limit,
-        } => {
-            if *pending {
-                backfill(&mut store, *limit, cli.json)
-            } else if ids.is_empty() {
-                eprintln!("rssr: give item ids, or --pending to catch up marked feeds");
-                Ok(ExitCode::from(2))
-            } else {
-                extract_items(&store, ids, cli.json)
-            }
-        }
+        Command::Feeds { failing, folder } => feeds(&store, *failing, folder.as_deref(), json),
+        Command::Feed {
+            id,
+            full_content,
+            rename,
+            folder,
+            remove,
+        } => feed(&store, *id, *full_content, rename, folder, *remove, json),
         Command::List {
+            all,
+            starred,
+            feed,
+            folder,
+            since,
+            limit,
+            per_feed,
+            snippet,
+            dedupe,
+        } => {
+            let query = Query {
+                unread_only: !all,
+                starred_only: *starred,
+                feed_id: *feed,
+                folder: folder.clone(),
+                since: since.as_deref().map(parse_since).transpose()?,
+                limit: *limit,
+                per_feed: *per_feed,
+                snippet: *snippet,
+                dedupe: *dedupe,
+            };
+            list(&store, query, json)
+        }
+        Command::Read {
+            ids,
+            full,
+            max_tokens,
+        } => read(&store, ids, *full, *max_tokens, json),
+        Command::Search {
+            text,
             all,
             feed,
             folder,
+            since,
             limit,
-        } => list(
-            &store,
-            Query {
+        } => {
+            let query = Query {
                 unread_only: !all,
                 feed_id: *feed,
                 folder: folder.clone(),
+                since: since.as_deref().map(parse_since).transpose()?,
                 limit: *limit,
-            },
-            cli.json,
-        ),
-        Command::Read { ids, full } => read(&store, ids, *full, cli.json),
-        Command::Search { text, limit } => search(&store, text, *limit, cli.json),
-        Command::Mark { flag, ids } => mark(&store, ids, (*flag).into(), cli.json),
-    }
-}
-
-fn list(store: &Store, query: Query, as_json: bool) -> Result<ExitCode> {
-    let items = store.items(&query)?;
-    let total = store.count(&query)?;
-
-    if as_json {
-        print(&json!({ "count": items.len(), "total": total, "items": rows(&items) }));
-    } else if items.is_empty() {
-        println!("no items match. {}", why_empty(store, &query)?);
-    } else {
-        show(&items);
-        println!("{} of {total}", items.len());
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// An empty list has several causes and an agent cannot guess which.
-fn why_empty(store: &Store, query: &Query) -> Result<String> {
-    let stats = store.stats()?;
-    Ok(if stats.feeds == 0 {
-        "no feeds subscribed - run `rssr import <file.opml>`".into()
-    } else if stats.items == 0 {
-        "feeds are subscribed but never fetched - run `rssr refresh`".into()
-    } else if query.unread_only && stats.unread == 0 {
-        format!(
-            "all {} items are read - `rssr list --all` shows them",
-            stats.items
-        )
-    } else if query.feed_id.is_some() || query.folder.is_some() {
-        format!("the filter matched none of {} items", stats.items)
-    } else {
-        format!("{} items stored, none unread", stats.items)
-    })
-}
-
-fn rows(items: &[Item]) -> Vec<serde_json::Value> {
-    items
-        .iter()
-        .map(|item| {
-            json!({
-                "id": item.id,
-                "feed": item.feed_title,
-                "title": item.title,
-                "url": item.url,
-                "author": item.author,
-                "published": item.published,
-                "read": item.read,
-                "starred": item.starred,
-            })
-        })
-        .collect()
-}
-
-fn show(items: &[Item]) {
-    for item in items {
-        println!(
-            "{}  {}{}  {:<14} {:<10} {}",
-            item.id,
-            if item.read { " " } else { "*" },
-            if item.starred { "s" } else { " " },
-            truncate(item.feed_title.as_deref().unwrap_or("-"), 14),
-            item.published
-                .as_deref()
-                .unwrap_or("")
-                .get(..10)
-                .unwrap_or(""),
-            item.title.as_deref().unwrap_or("(untitled)"),
-        );
-    }
-}
-
-fn backfill(store: &mut Store, limit: usize, as_json: bool) -> Result<ExitCode> {
-    let fetcher = Fetcher::new();
-    let summary = refresh::extract_pending(store, &fetcher, limit, 16)?;
-    if as_json {
-        print(&json!({ "extracted": summary.extracted, "failed": summary.failed }));
-    } else {
-        println!("{} extracted, {} failed", summary.extracted, summary.failed);
-    }
-    Ok(if summary.failed > 0 && summary.extracted == 0 {
-        ExitCode::from(4)
-    } else {
-        ExitCode::SUCCESS
-    })
-}
-
-fn set_full_content(store: &Store, id: i64, on: bool, as_json: bool) -> Result<ExitCode> {
-    if !store.set_full_content(id, on)? {
-        eprintln!("no such feed: {id}");
-        return Ok(ExitCode::from(1));
-    }
-    if as_json {
-        print(&json!({ "feed": id, "full_content": on }));
-    } else {
-        println!("feed {id}: full content {}", if on { "on" } else { "off" });
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn extract_items(store: &Store, ids: &[String], as_json: bool) -> Result<ExitCode> {
-    let fetcher = Fetcher::new();
-    let mut results = Vec::new();
-    let mut failed = 0;
-
-    for id in ids {
-        let Some(url) = store.item_url(id)? else {
-            failed += 1;
-            results.push(json!({ "id": id, "ok": false, "error": "no such item or no link" }));
-            continue;
-        };
-        match extract::from_url(&fetcher, &url) {
-            Ok(article) => {
-                let content = match store.body(id)?.and_then(|body| body.title) {
-                    Some(title) => extract::drop_repeated_heading(&article.content, &title),
-                    None => article.content,
-                };
-                store.save_body(id, &content, "extracted")?;
-                results.push(json!({ "id": id, "ok": true, "chars": article.chars, "url": url }));
-            }
-            Err(e) => {
-                failed += 1;
-                results.push(json!({ "id": id, "ok": false, "error": e.to_string() }));
+                ..Query::default()
+            };
+            search(&store, text, query, json)
+        }
+        Command::Mark { flag, ids } => mark(&store, ids, (*flag).into(), json),
+        Command::Extract {
+            ids,
+            pending,
+            feed,
+            limit,
+        } => {
+            if *pending {
+                backfill(&mut store, *limit, *feed, json)
+            } else if ids.is_empty() {
+                eprintln!("rssr: give item ids, or --pending to catch up marked feeds");
+                Ok(ExitCode::from(USAGE))
+            } else {
+                extract_items(&store, ids, json)
             }
         }
     }
-
-    if as_json {
-        print(&json!({ "count": results.len(), "failed": failed, "items": results }));
-    } else {
-        for result in &results {
-            match result["ok"].as_bool() {
-                Some(true) => println!("{} {} chars", result["id"], result["chars"]),
-                _ => eprintln!("{}: {}", result["id"], result["error"]),
-            }
-        }
-    }
-
-    Ok(if failed == 0 {
-        ExitCode::SUCCESS
-    } else if failed == ids.len() {
-        ExitCode::from(4)
-    } else {
-        ExitCode::from(3)
-    })
-}
-
-const PREVIEW_CHARS: usize = 4000;
-
-fn read(store: &Store, ids: &[String], full: bool, as_json: bool) -> Result<ExitCode> {
-    let mut found = Vec::new();
-    let mut missing = Vec::new();
-
-    for id in ids {
-        match store.body(id)? {
-            Some(body) => found.push(body),
-            None => missing.push(id.clone()),
-        }
-    }
-
-    if as_json {
-        let items: Vec<_> = found
-            .iter()
-            .map(|body| {
-                let text = content::to_markdown(&body.content);
-                let (text, truncated) = clip(&text, full);
-                json!({
-                    "id": body.item_id,
-                    "title": body.title,
-                    "url": body.url,
-                    "source": body.source,
-                    "tokens_estimate": content::estimate_tokens(&text),
-                    "truncated": truncated,
-                    "content": text,
-                })
-            })
-            .collect();
-        print(&json!({ "count": items.len(), "items": items, "missing": missing }));
-    } else {
-        for body in &found {
-            println!("{}", body.title.as_deref().unwrap_or("(untitled)"));
-            if let Some(url) = &body.url {
-                println!("{url}");
-            }
-            let (text, truncated) = clip(&content::to_markdown(&body.content), full);
-            println!("\n{text}");
-            if truncated {
-                println!("\n[truncated, rerun with --full]");
-            }
-            println!();
-        }
-        for id in &missing {
-            eprintln!("no such item: {id}");
-        }
-    }
-
-    Ok(if found.is_empty() && !missing.is_empty() {
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    })
-}
-
-fn clip(text: &str, full: bool) -> (String, bool) {
-    if full {
-        return (text.to_string(), false);
-    }
-    match text.char_indices().nth(PREVIEW_CHARS) {
-        Some((cut, _)) => (text[..cut].to_string(), true),
-        None => (text.to_string(), false),
-    }
-}
-
-fn search(store: &Store, text: &str, limit: usize, as_json: bool) -> Result<ExitCode> {
-    let items = store.search(text, limit)?;
-    if as_json {
-        print(&json!({ "count": items.len(), "items": rows(&items) }));
-    } else if items.is_empty() {
-        let stats = store.stats()?;
-        println!("no matches for {text:?} in {} items", stats.items);
-    } else {
-        show(&items);
-        println!("{} matches", items.len());
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-fn mark(store: &Store, ids: &[String], flag: Flag, as_json: bool) -> Result<ExitCode> {
-    let changed = store.set_flag(ids, flag)?;
-    if as_json {
-        print(&json!({ "matched": changed, "requested": ids.len() }));
-    } else {
-        println!("{changed} of {} items updated", ids.len());
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Clips to `width` printed characters, ellipsis included, so columns line up.
-fn truncate(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
-        return value.to_string();
-    }
-    let cut = value
-        .char_indices()
-        .nth(width.saturating_sub(1))
-        .map_or(value.len(), |(index, _)| index);
-    format!("{}…", &value[..cut])
 }
 
 /// What a bare `rssr` prints: where the database is, what is in it, and the
 /// commands worth running next. An agent should not need a manual to start.
 fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
     let stats = store.stats()?;
-    let recent = one_per_feed(
-        store.items(&Query {
-            limit: 60,
-            ..Query::default()
-        })?,
-        8,
-    );
+    let recent = store.items(&Query {
+        limit: 8,
+        per_feed: Some(1),
+        ..Query::default()
+    })?;
     let next = next_steps(&stats);
 
     if as_json {
@@ -488,10 +342,9 @@ fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
         }));
     } else {
         println!("db: {}", db.display());
-        if stats.feeds == 0 {
-            println!("feeds: none");
-        } else {
-            println!("feeds: {} in {} folders", stats.feeds, stats.folders);
+        match stats.feeds {
+            0 => println!("feeds: none"),
+            n => println!("feeds: {n} in {} folders", stats.folders),
         }
         println!("unread: {} of {} items", stats.unread, stats.items);
         if stats.starred > 0 || stats.full_text > 0 {
@@ -514,8 +367,7 @@ fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
             println!();
             show(&recent);
         }
-        println!();
-        println!("next:");
+        println!("\nnext:");
         for step in &next {
             println!("  {step}");
         }
@@ -523,32 +375,12 @@ fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// A burst from one busy feed would otherwise fill the whole sample and tell
-/// the reader nothing about the rest of their subscriptions.
-fn one_per_feed(items: Vec<Item>, keep: usize) -> Vec<Item> {
-    let mut seen = std::collections::HashSet::new();
-    let mut picked: Vec<Item> = items
-        .iter()
-        .filter(|item| seen.insert(item.feed_title.clone()))
-        .take(keep)
-        .cloned()
-        .collect();
-    if picked.len() < keep {
-        for item in items {
-            if picked.len() >= keep {
-                break;
-            }
-            if !picked.iter().any(|kept| kept.id == item.id) {
-                picked.push(item);
-            }
-        }
-    }
-    picked
-}
-
 fn next_steps(stats: &Stats) -> Vec<&'static str> {
     if stats.feeds == 0 {
-        vec!["rssr import <file.opml> - subscribe to every feed in an OPML export"]
+        vec![
+            "rssr add <url> - subscribe to one feed",
+            "rssr import <file.opml> - subscribe to every feed in an OPML export",
+        ]
     } else if stats.items == 0 {
         vec!["rssr refresh - fetch items for the feeds already subscribed"]
     } else if stats.unread == 0 {
@@ -558,7 +390,7 @@ fn next_steps(stats: &Stats) -> Vec<&'static str> {
         ]
     } else {
         vec![
-            "rssr list --limit 20 - newest unread items",
+            "rssr list --since 24h --per-feed 2 --snippet 200 - today, one feed cannot flood it",
             "rssr read <id> - one item as text",
             "rssr search <text> - full-text search",
             "rssr mark read <id> - reading never marks anything read on its own",
@@ -566,20 +398,101 @@ fn next_steps(stats: &Stats) -> Vec<&'static str> {
     }
 }
 
-fn import(store: &Store, file: &PathBuf, as_json: bool) -> Result<ExitCode> {
-    let subscriptions = opml::parse(&std::fs::read(file)?)?;
-    let mut added = 0;
-    for subscription in &subscriptions {
-        if store.feed_id(&subscription.url)?.is_none() {
-            added += 1;
+fn add(
+    store: &mut Store,
+    url: &str,
+    folder: &Option<String>,
+    title: &Option<String>,
+    as_json: bool,
+) -> Result<ExitCode> {
+    let subscription = Subscription {
+        url: url.to_string(),
+        title: title.clone(),
+        folder: folder.clone(),
+    };
+    let (id, outcome) = store.upsert_feed(&subscription, false)?;
+
+    let summary = refresh::refresh(
+        store,
+        &Fetcher::new(),
+        Options {
+            only_feed: Some(id),
+            ..Options::default()
+        },
+    )?;
+    let new_items = summary.new_items;
+    let failure = summary
+        .outcomes
+        .iter()
+        .find_map(|outcome| match &outcome.status {
+            Status::Failed { code, message } => Some((*code, message.clone())),
+            _ => None,
+        });
+
+    let stored = store.feeds()?.into_iter().find(|feed| feed.id == id);
+    let feed_title = stored.and_then(|feed| feed.title);
+
+    if as_json {
+        print(&json!({
+            "feed": id,
+            "url": url,
+            "title": feed_title,
+            "added": outcome == Upsert::Added,
+            "new_items": new_items,
+            "error": failure.as_ref().map(|(_, message)| message),
+            "code": failure.as_ref().map(|(code, _)| *code),
+        }));
+    } else {
+        match (&outcome, &failure) {
+            (Upsert::Added, None) => println!(
+                "feed {id}: {} - {new_items} items",
+                feed_title.as_deref().unwrap_or(url)
+            ),
+            (_, None) => println!("feed {id}: already subscribed - {new_items} new items"),
+            (_, Some((code, message))) => eprintln!("feed {id}: {code} {message}"),
         }
-        store.upsert_feed(subscription)?;
+    }
+    Ok(match failure {
+        Some(_) => ExitCode::from(FAILED),
+        None => ExitCode::SUCCESS,
+    })
+}
+
+fn import(store: &Store, file: &PathBuf, update: bool, as_json: bool) -> Result<ExitCode> {
+    let subscriptions = opml::parse(&std::fs::read(file)?)?;
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut unchanged = 0;
+
+    for subscription in &subscriptions {
+        let (id, outcome) = store.upsert_feed(subscription, update)?;
+        let row = json!({ "id": id, "url": subscription.url, "title": subscription.title });
+        match outcome {
+            Upsert::Added => added.push(row),
+            Upsert::Updated => updated.push(row),
+            Upsert::Unchanged => unchanged += 1,
+        }
     }
 
     if as_json {
-        print(&json!({ "found": subscriptions.len(), "added": added }));
+        print(&json!({
+            "found": subscriptions.len(),
+            "added": added.len(),
+            "updated": updated.len(),
+            "unchanged": unchanged,
+            "added_feeds": added,
+            "updated_feeds": updated,
+        }));
     } else {
-        println!("{} feeds in file, {added} new", subscriptions.len());
+        println!(
+            "{} feeds in file: {} new, {} updated, {unchanged} unchanged",
+            subscriptions.len(),
+            added.len(),
+            updated.len()
+        );
+        if !update && unchanged > 0 {
+            println!("(titles and folders already stored were kept; --update replaces them)");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -587,17 +500,23 @@ fn import(store: &Store, file: &PathBuf, as_json: bool) -> Result<ExitCode> {
 fn do_refresh(
     store: &mut Store,
     options: Options,
-    timeout: std::time::Duration,
+    timeout: Duration,
     with_extract: bool,
     as_json: bool,
 ) -> Result<ExitCode> {
     let fetcher = Fetcher::with_timeout(timeout);
     let summary = refresh::refresh(store, &fetcher, options)?;
     let extracted = if with_extract {
-        refresh::extract_pending(store, &fetcher, 25, options.workers)?
+        refresh::extract_pending(store, &fetcher, 25, options.workers, options.only_feed)?
     } else {
         Default::default()
     };
+
+    let by_url: std::collections::HashMap<String, i64> = store
+        .feeds()?
+        .into_iter()
+        .map(|feed| (feed.url, feed.id))
+        .collect();
 
     if as_json {
         let feeds: Vec<_> = summary
@@ -615,6 +534,7 @@ fn do_refresh(
                     }
                 };
                 json!({
+                    "feed": by_url.get(&outcome.url),
                     "url": outcome.url,
                     "status": status,
                     "elapsed_ms": outcome.elapsed_ms,
@@ -659,16 +579,28 @@ fn do_refresh(
 
     Ok(match summary.failed {
         0 => ExitCode::SUCCESS,
-        n if n == summary.outcomes.len() => ExitCode::from(4),
-        _ => ExitCode::from(3),
+        n if n == summary.outcomes.len() => ExitCode::from(FAILED),
+        _ => ExitCode::from(PARTIAL),
     })
 }
 
-fn feeds(store: &Store, failing_only: bool, as_json: bool) -> Result<ExitCode> {
+fn feeds(
+    store: &Store,
+    failing_only: bool,
+    folder: Option<&str>,
+    as_json: bool,
+) -> Result<ExitCode> {
     let mut feeds = store.feeds()?;
     if failing_only {
         feeds.retain(|feed| feed.status.as_deref() == Some("error"));
     }
+    if let Some(folder) = folder {
+        if !store.folders()?.iter().any(|known| known == folder) {
+            return unknown_folder(store, folder, as_json);
+        }
+        feeds.retain(|feed| feed.folder.as_deref() == Some(folder));
+    }
+
     if as_json {
         let rows: Vec<_> = feeds
             .iter()
@@ -689,17 +621,17 @@ fn feeds(store: &Store, failing_only: bool, as_json: bool) -> Result<ExitCode> {
     } else if feeds.is_empty() && failing_only {
         println!("no failing feeds");
     } else if feeds.is_empty() {
-        println!("no feeds subscribed - run `rssr import <file.opml>`");
+        println!("no feeds subscribed - run `rssr add <url>` or `rssr import <file.opml>`");
     } else {
         let mut current: Option<&str> = None;
         for feed in &feeds {
-            let folder = feed.folder.as_deref().unwrap_or("(no folder)");
-            if current != Some(folder) {
+            let group = feed.folder.as_deref().unwrap_or("(no folder)");
+            if current != Some(group) {
                 if current.is_some() {
                     println!();
                 }
-                println!("{folder}");
-                current = Some(folder);
+                println!("{group}");
+                current = Some(group);
             }
             println!(
                 "  {:>3}  {:<28}  {:>5} unread  {:<12}  {}",
@@ -717,7 +649,412 @@ fn feeds(store: &Store, failing_only: bool, as_json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn print(value: &serde_json::Value) {
+fn feed(
+    store: &Store,
+    id: i64,
+    full_content: Option<Toggle>,
+    rename: &Option<String>,
+    folder: &Option<String>,
+    remove: bool,
+    as_json: bool,
+) -> Result<ExitCode> {
+    if !store.feed_exists(id)? {
+        return missing_feed(store, id, as_json);
+    }
+
+    if remove {
+        store.remove_feed(id)?;
+        if as_json {
+            print(&json!({ "feed": id, "removed": true }));
+        } else {
+            println!("feed {id} removed with all of its items");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    if full_content.is_none() && rename.is_none() && folder.is_none() {
+        eprintln!("rssr: nothing to change; pass --full-content, --rename, --folder or --remove");
+        return Ok(ExitCode::from(USAGE));
+    }
+
+    if let Some(toggle) = full_content {
+        store.set_full_content(id, matches!(toggle, Toggle::On))?;
+    }
+    if rename.is_some() || folder.is_some() {
+        let url = store
+            .feeds()?
+            .into_iter()
+            .find(|feed| feed.id == id)
+            .map(|feed| feed.url)
+            .unwrap_or_default();
+        store.upsert_feed(
+            &Subscription {
+                url,
+                title: rename.clone(),
+                folder: folder.clone(),
+            },
+            true,
+        )?;
+    }
+
+    let updated = store.feeds()?.into_iter().find(|feed| feed.id == id);
+    if as_json {
+        print(&json!({
+            "feed": id,
+            "title": updated.as_ref().and_then(|feed| feed.title.clone()),
+            "folder": updated.as_ref().and_then(|feed| feed.folder.clone()),
+            "full_content": updated.as_ref().is_some_and(|feed| feed.full_content),
+        }));
+    } else if let Some(feed) = updated {
+        println!(
+            "feed {id}: {} in {} - full content {}",
+            feed.title.as_deref().unwrap_or("(untitled)"),
+            feed.folder.as_deref().unwrap_or("(no folder)"),
+            if feed.full_content { "on" } else { "off" }
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn list(store: &Store, query: Query, as_json: bool) -> Result<ExitCode> {
+    if let Some(id) = query.feed_id
+        && !store.feed_exists(id)?
+    {
+        return missing_feed(store, id, as_json);
+    }
+    if let Some(folder) = &query.folder
+        && !store.folders()?.iter().any(|known| known == folder)
+    {
+        return unknown_folder(store, folder, as_json);
+    }
+
+    let items = store.items(&query)?;
+    let total = store.count(&query)?;
+
+    if as_json {
+        print(&json!({ "count": items.len(), "total": total, "items": rows(&items) }));
+    } else if items.is_empty() {
+        println!("no items match. {}", why_empty(store, &query)?);
+    } else {
+        show(&items);
+        println!("{} of {total}", items.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// An empty list has several causes and an agent cannot guess which.
+fn why_empty(store: &Store, query: &Query) -> Result<String> {
+    let stats = store.stats()?;
+    Ok(if stats.feeds == 0 {
+        "no feeds subscribed - run `rssr add <url>`".into()
+    } else if stats.items == 0 {
+        "feeds are subscribed but never fetched - run `rssr refresh`".into()
+    } else if query.starred_only {
+        "nothing starred - `rssr mark star <id>` adds to that queue".into()
+    } else if query.since.is_some() {
+        "nothing that recent - widen --since".into()
+    } else if query.unread_only && stats.unread == 0 {
+        format!(
+            "all {} items are read - `rssr list --all` shows them",
+            stats.items
+        )
+    } else if query.feed_id.is_some() || query.folder.is_some() {
+        format!("the filter matched none of {} items", stats.items)
+    } else {
+        format!("{} items stored, none unread", stats.items)
+    })
+}
+
+fn read(
+    store: &Store,
+    ids: &[String],
+    full: bool,
+    max_tokens: Option<usize>,
+    as_json: bool,
+) -> Result<ExitCode> {
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    for id in ids {
+        match store.body(id)? {
+            Some(body) => found.push(body),
+            None => missing.push(id.clone()),
+        }
+    }
+
+    // A budget is shared out evenly, so asking for five items never returns
+    // five times the ceiling.
+    let per_item = match (full, max_tokens) {
+        (true, None) => usize::MAX,
+        (_, Some(budget)) => (budget * 4 / found.len().max(1)).max(200),
+        (false, None) => PREVIEW_CHARS,
+    };
+
+    if as_json {
+        let items: Vec<_> = found
+            .iter()
+            .map(|body| {
+                let markdown = content::to_markdown(&body.content);
+                let (text, truncated) = clip(&markdown, per_item);
+                json!({
+                    "id": body.item_id,
+                    "feed": body.feed_title,
+                    "feed_id": body.feed_id,
+                    "title": body.title,
+                    "url": body.url,
+                    "author": body.author,
+                    "published": body.published,
+                    "source": body.source,
+                    "read": body.read,
+                    "starred": body.starred,
+                    "tokens_estimate": content::estimate_tokens(&text),
+                    "truncated": truncated,
+                    "content": text,
+                })
+            })
+            .collect();
+        print(&json!({ "count": items.len(), "items": items, "missing": missing }));
+    } else {
+        for body in &found {
+            println!("{}", body.title.as_deref().unwrap_or("(untitled)"));
+            if let Some(url) = &body.url {
+                println!("{url}");
+            }
+            let (text, truncated) = clip(&content::to_markdown(&body.content), per_item);
+            println!("\n{text}");
+            if truncated {
+                println!("\n[truncated; --full or --max-tokens N for more]");
+            }
+            println!();
+        }
+        for id in &missing {
+            eprintln!("no such item: {id}");
+        }
+    }
+
+    Ok(if missing.is_empty() {
+        ExitCode::SUCCESS
+    } else if found.is_empty() {
+        ExitCode::from(NOT_FOUND)
+    } else {
+        ExitCode::from(PARTIAL)
+    })
+}
+
+fn search(store: &Store, text: &str, query: Query, as_json: bool) -> Result<ExitCode> {
+    if let Some(id) = query.feed_id
+        && !store.feed_exists(id)?
+    {
+        return missing_feed(store, id, as_json);
+    }
+    if let Some(folder) = &query.folder
+        && !store.folders()?.iter().any(|known| known == folder)
+    {
+        return unknown_folder(store, folder, as_json);
+    }
+
+    let items = store.search(text, &query)?;
+    if as_json {
+        print(&json!({ "count": items.len(), "query": text, "items": rows(&items) }));
+    } else if items.is_empty() {
+        let stats = store.stats()?;
+        println!("no matches for {text:?} in {} items", stats.items);
+    } else {
+        show(&items);
+        println!("{} matches", items.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn mark(store: &Store, ids: &[String], flag: Flag, as_json: bool) -> Result<ExitCode> {
+    let changed = store.set_flag(ids, flag)?;
+    if as_json {
+        print(&json!({ "matched": changed, "requested": ids.len() }));
+    } else {
+        println!("{changed} of {} items updated", ids.len());
+    }
+    Ok(if changed == ids.len() {
+        ExitCode::SUCCESS
+    } else if changed == 0 {
+        ExitCode::from(NOT_FOUND)
+    } else {
+        ExitCode::from(PARTIAL)
+    })
+}
+
+fn extract_items(store: &Store, ids: &[String], as_json: bool) -> Result<ExitCode> {
+    let fetcher = Fetcher::new();
+    let mut results = Vec::new();
+    let mut failed = 0;
+
+    for id in ids {
+        let Some(url) = store.item_url(id)? else {
+            failed += 1;
+            results
+                .push(json!({ "id": id, "ok": false, "error": "no such item, or it has no link" }));
+            continue;
+        };
+        match extract::from_url(&fetcher, &url) {
+            Ok(article) => {
+                let content = match store.body(id)?.and_then(|body| body.title) {
+                    Some(title) => extract::drop_repeated_heading(&article.content, &title),
+                    None => article.content,
+                };
+                store.save_body(id, &content, "extracted")?;
+                results.push(json!({ "id": id, "ok": true, "chars": article.chars, "url": url }));
+            }
+            Err(e) => {
+                failed += 1;
+                results.push(json!({ "id": id, "ok": false, "error": e.to_string() }));
+            }
+        }
+    }
+
+    if as_json {
+        print(&json!({ "count": results.len(), "failed": failed, "items": results }));
+    } else {
+        for result in &results {
+            match result["ok"].as_bool() {
+                Some(true) => println!("{} {} chars", result["id"], result["chars"]),
+                _ => eprintln!("{}: {}", result["id"], result["error"]),
+            }
+        }
+    }
+
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else if failed == ids.len() {
+        ExitCode::from(FAILED)
+    } else {
+        ExitCode::from(PARTIAL)
+    })
+}
+
+fn backfill(store: &mut Store, limit: usize, feed: Option<i64>, as_json: bool) -> Result<ExitCode> {
+    if let Some(id) = feed
+        && !store.feed_exists(id)?
+    {
+        return missing_feed(store, id, as_json);
+    }
+    let fetcher = Fetcher::new();
+    let summary = refresh::extract_pending(store, &fetcher, limit, 16, feed)?;
+    if as_json {
+        print(&json!({ "extracted": summary.extracted, "failed": summary.failed }));
+    } else if summary.extracted == 0 && summary.failed == 0 {
+        println!("nothing to scrape - switch a feed on with `rssr feed <id> --full-content on`");
+    } else {
+        println!("{} extracted, {} failed", summary.extracted, summary.failed);
+    }
+    Ok(if summary.failed > 0 && summary.extracted == 0 {
+        ExitCode::from(FAILED)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn missing_feed(store: &Store, id: i64, as_json: bool) -> Result<ExitCode> {
+    let known: Vec<i64> = store.feeds()?.iter().map(|feed| feed.id).collect();
+    if as_json {
+        print(&json!({ "error": format!("no feed with id {id}"), "known_feeds": known }));
+    } else {
+        eprintln!(
+            "no feed with id {id}. `rssr feeds` lists the {} there are",
+            known.len()
+        );
+    }
+    Ok(ExitCode::from(NOT_FOUND))
+}
+
+fn unknown_folder(store: &Store, folder: &str, as_json: bool) -> Result<ExitCode> {
+    let known = store.folders()?;
+    if as_json {
+        print(&json!({ "error": format!("no folder named {folder:?}"), "known_folders": known }));
+    } else {
+        eprintln!("no folder named {folder:?}. known folders:");
+        for name in &known {
+            eprintln!("  {name}");
+        }
+    }
+    Ok(ExitCode::from(NOT_FOUND))
+}
+
+const PREVIEW_CHARS: usize = 4000;
+
+fn rows(items: &[Item]) -> Vec<Value> {
+    items
+        .iter()
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "feed": item.feed_title,
+                "feed_id": item.feed_id,
+                "title": item.title,
+                "url": item.url,
+                "author": item.author,
+                "published": item.published,
+                "read": item.read,
+                "starred": item.starred,
+                "snippet": item.snippet,
+                "score": item.score,
+                "duplicates": item.duplicates,
+            })
+        })
+        .collect()
+}
+
+fn show(items: &[Item]) {
+    for item in items {
+        println!(
+            "{}  {}{}  {:<14} {:<10} {}",
+            item.id,
+            if item.read { " " } else { "*" },
+            if item.starred { "s" } else { " " },
+            truncate(item.feed_title.as_deref().unwrap_or("-"), 14),
+            item.published
+                .as_deref()
+                .unwrap_or("")
+                .get(..10)
+                .unwrap_or(""),
+            item.title.as_deref().unwrap_or("(untitled)"),
+        );
+        if let Some(snippet) = &item.snippet {
+            println!("      {snippet}");
+        }
+    }
+}
+
+fn clip(text: &str, chars: usize) -> (String, bool) {
+    match text.char_indices().nth(chars) {
+        Some((cut, _)) => (text[..cut].to_string(), true),
+        None => (text.to_string(), false),
+    }
+}
+
+/// Clips to `width` printed characters, ellipsis included, so columns line up.
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    let cut = value
+        .char_indices()
+        .nth(width.saturating_sub(1))
+        .map_or(value.len(), |(index, _)| index);
+    format!("{}…", &value[..cut])
+}
+
+/// `--since` takes either a duration back from now, or a calendar date.
+fn parse_since(value: &str) -> Result<DateTime<Utc>> {
+    if let Ok(date) = NaiveDate::parse_from_str(value, "%Y-%m-%d") {
+        let midnight = date.and_hms_opt(0, 0, 0).unwrap();
+        return Ok(Utc.from_utc_datetime(&midnight));
+    }
+    if let Ok(at) = DateTime::parse_from_rfc3339(value) {
+        return Ok(at.with_timezone(&Utc));
+    }
+    let ago = duration::parse(value)?;
+    Ok(Utc::now() - chrono::Duration::from_std(ago).unwrap_or_default())
+}
+
+fn print(value: &Value) {
     println!(
         "{}",
         serde_json::to_string_pretty(value).unwrap_or_default()

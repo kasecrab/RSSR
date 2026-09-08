@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -100,6 +101,7 @@ pub struct Feed {
 #[derive(Debug, Clone)]
 pub struct Item {
     pub id: String,
+    pub feed_id: i64,
     pub feed_title: Option<String>,
     pub title: Option<String>,
     pub url: Option<String>,
@@ -107,13 +109,25 @@ pub struct Item {
     pub published: Option<String>,
     pub read: bool,
     pub starred: bool,
+    /// Plain-text opening of the item, when the caller asked for one.
+    pub snippet: Option<String>,
+    /// Search relevance; lower is better. Only set by `search`.
+    pub score: Option<f64>,
+    /// Other copies of this item collapsed into it, when deduplicating.
+    pub duplicates: usize,
 }
 
 #[derive(Debug, Clone)]
 pub struct Body {
     pub item_id: String,
+    pub feed_id: i64,
+    pub feed_title: Option<String>,
     pub title: Option<String>,
     pub url: Option<String>,
+    pub author: Option<String>,
+    pub published: Option<String>,
+    pub read: bool,
+    pub starred: bool,
     pub content: String,
     pub format: String,
     pub source: String,
@@ -122,20 +136,54 @@ pub struct Body {
 #[derive(Debug, Clone)]
 pub struct Query {
     pub unread_only: bool,
+    pub starred_only: bool,
     pub feed_id: Option<i64>,
     pub folder: Option<String>,
+    /// Only items dated at or after this instant.
+    pub since: Option<DateTime<Utc>>,
     pub limit: usize,
+    /// At most this many items from any one feed, so a busy feed cannot fill
+    /// the whole page.
+    pub per_feed: Option<usize>,
+    /// Characters of plain-text preview to include with each item.
+    pub snippet: Option<usize>,
+    /// Collapse the same story arriving from several feeds into one row.
+    pub dedupe: bool,
 }
 
 impl Default for Query {
     fn default() -> Self {
         Query {
             unread_only: true,
+            starred_only: false,
             feed_id: None,
             folder: None,
+            since: None,
             limit: 50,
+            per_feed: None,
+            snippet: None,
+            dedupe: false,
         }
     }
+}
+
+impl Query {
+    fn bindings(&self) -> [Box<dyn rusqlite::ToSql>; 5] {
+        [
+            Box::new(self.unread_only as i64),
+            Box::new(self.feed_id),
+            Box::new(self.folder.clone()),
+            Box::new(self.starred_only as i64),
+            Box::new(self.since.map(stamp)),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Upsert {
+    Added,
+    Updated,
+    Unchanged,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +215,14 @@ const LATEST_VERSION: i64 = 3;
 
 const FILTER: &str = "WHERE (?1 = 0 OR items.read = 0)
               AND (?2 IS NULL OR items.feed_id = ?2)
-              AND (?3 IS NULL OR feeds.folder = ?3)";
+              AND (?3 IS NULL OR feeds.folder = ?3)
+              AND (?4 = 0 OR items.starred = 1)
+              AND (?5 IS NULL OR COALESCE(items.published, items.updated, items.seen_at) >= ?5)";
+
+const COLUMNS: &str = "items.id, items.feed_id, feeds.title, items.title, items.url,
+                       items.author,
+                       COALESCE(items.published, items.updated, items.seen_at) AS at,
+                       items.read, items.starred";
 
 #[derive(Debug, Clone, Default)]
 pub struct Stats {
@@ -224,18 +279,63 @@ impl Store {
         Ok(())
     }
 
-    /// Adds a feed, or refreshes the labels of one already subscribed.
-    /// Cache validators are left alone so an import does not force a refetch.
-    pub fn upsert_feed(&self, sub: &Subscription) -> Result<i64> {
+    /// Adds a feed. A feed already subscribed keeps the title and folder it
+    /// has unless `overwrite` is set: an import should not silently rename
+    /// feeds or move them between folders.
+    pub fn upsert_feed(&self, sub: &Subscription, overwrite: bool) -> Result<(i64, Upsert)> {
+        if let Some(id) = self.feed_id(&sub.url)? {
+            if !overwrite {
+                return Ok((id, Upsert::Unchanged));
+            }
+            let changed = self.conn.execute(
+                "UPDATE feeds SET
+                     title  = COALESCE(?2, title),
+                     folder = COALESCE(?3, folder)
+                 WHERE id = ?1 AND (title IS NOT ?2 OR folder IS NOT ?3)",
+                params![id, sub.title, sub.folder],
+            )?;
+            return Ok((
+                id,
+                if changed > 0 {
+                    Upsert::Updated
+                } else {
+                    Upsert::Unchanged
+                },
+            ));
+        }
+
         self.conn.execute(
-            "INSERT INTO feeds (url, title, folder) VALUES (?1, ?2, ?3)
-             ON CONFLICT(url) DO UPDATE SET
-                 title  = COALESCE(excluded.title, feeds.title),
-                 folder = COALESCE(excluded.folder, feeds.folder)",
+            "INSERT INTO feeds (url, title, folder) VALUES (?1, ?2, ?3)",
             params![sub.url, sub.title, sub.folder],
         )?;
-        self.feed_id(&sub.url)?
-            .ok_or_else(|| Error::Config(format!("feed vanished after insert: {}", sub.url)))
+        let id = self
+            .feed_id(&sub.url)?
+            .ok_or_else(|| Error::Config(format!("feed vanished after insert: {}", sub.url)))?;
+        Ok((id, Upsert::Added))
+    }
+
+    /// Unsubscribes and drops everything stored for the feed.
+    pub fn remove_feed(&self, feed_id: i64) -> Result<bool> {
+        let removed = self
+            .conn
+            .execute("DELETE FROM feeds WHERE id = ?1", [feed_id])?;
+        Ok(removed > 0)
+    }
+
+    pub fn feed_exists(&self, feed_id: i64) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row("SELECT 1 FROM feeds WHERE id = ?1", [feed_id], |_| Ok(()))
+            .optional()?
+            .is_some())
+    }
+
+    pub fn folders(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT folder FROM feeds WHERE folder IS NOT NULL ORDER BY folder",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn feed_id(&self, url: &str) -> Result<Option<i64>> {
@@ -379,26 +479,42 @@ impl Store {
     }
 
     pub fn items(&self, query: &Query) -> Result<Vec<Item>> {
+        // `per_feed` needs more rows than asked for, since the cap is applied
+        // after ordering; without a limit at all a large database would be
+        // read end to end.
+        let fetch = match (query.per_feed, query.dedupe) {
+            (None, false) => query.limit,
+            _ => (query.limit * 20).max(500),
+        };
         let sql = format!(
-            "SELECT items.id, feeds.title, items.title, items.url, items.author,
-                    COALESCE(items.published, items.updated, items.seen_at) AS at,
-                    items.read, items.starred
-             FROM items JOIN feeds ON feeds.id = items.feed_id
+            "SELECT {COLUMNS}, COALESCE(bodies.content, items.summary)
+             FROM items
+             JOIN feeds ON feeds.id = items.feed_id
+             LEFT JOIN bodies ON bodies.item_id = items.id
              {FILTER}
              ORDER BY at DESC
-             LIMIT ?4"
+             LIMIT ?6"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map(
-            params![
-                query.unread_only as i64,
-                query.feed_id,
-                query.folder,
-                query.limit as i64
-            ],
-            read_item,
-        )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let bindings = query.bindings();
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            bindings.iter().map(|value| value.as_ref()).collect();
+        let fetch = fetch as i64;
+        params.push(&fetch);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let mut item = read_item(row)?;
+            item.snippet = query.snippet.and_then(|width| {
+                row.get::<_, Option<String>>(9)
+                    .ok()
+                    .flatten()
+                    .map(|text| crate::content::preview(&text, width))
+            });
+            Ok(item)
+        })?;
+        let items = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let items = collapse_duplicates(items, query);
+        Ok(cap_per_feed(items, query))
     }
 
     /// How many items the query matches in total, so a caller never has to
@@ -406,26 +522,42 @@ impl Store {
     pub fn count(&self, query: &Query) -> Result<i64> {
         let sql =
             format!("SELECT COUNT(*) FROM items JOIN feeds ON feeds.id = items.feed_id {FILTER}");
-        Ok(self.conn.query_row(
-            &sql,
-            params![query.unread_only as i64, query.feed_id, query.folder],
-            |row| row.get(0),
-        )?)
+        let bindings = query.bindings();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            bindings.iter().map(|value| value.as_ref()).collect();
+        Ok(self
+            .conn
+            .query_row(&sql, params.as_slice(), |row| row.get(0))?)
     }
 
-    pub fn search(&self, text: &str, limit: usize) -> Result<Vec<Item>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT items.id, feeds.title, items.title, items.url, items.author,
-                    COALESCE(items.published, items.updated, items.seen_at),
-                    items.read, items.starred
+    /// Full-text search, honouring the same filters as `items` so a caller can
+    /// scope a query to one feed, folder, or time window.
+    pub fn search(&self, text: &str, query: &Query) -> Result<Vec<Item>> {
+        let sql = format!(
+            "SELECT {COLUMNS},
+                    snippet(items_fts, -1, '', '', '…', 24),
+                    bm25(items_fts)
              FROM items_fts
              JOIN items ON items.rowid = items_fts.rowid
              JOIN feeds ON feeds.id = items.feed_id
-             WHERE items_fts MATCH ?1
+             {FILTER} AND items_fts MATCH ?6
              ORDER BY bm25(items_fts)
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![text, limit as i64], read_item)?;
+             LIMIT ?7"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let bindings = query.bindings();
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            bindings.iter().map(|value| value.as_ref()).collect();
+        let limit = query.limit as i64;
+        params.push(&text);
+        params.push(&limit);
+
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            let mut item = read_item(row)?;
+            item.snippet = row.get::<_, Option<String>>(9)?;
+            item.score = row.get::<_, Option<f64>>(10)?;
+            Ok(item)
+        })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -480,21 +612,32 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT items.id, items.title, items.url,
+                "SELECT items.id, items.feed_id, feeds.title, items.title, items.url,
+                        items.author,
+                        COALESCE(items.published, items.updated, items.seen_at),
+                        items.read, items.starred,
                         COALESCE(bodies.content, items.summary, ''),
                         COALESCE(bodies.format, 'html'),
                         COALESCE(bodies.source, 'summary')
-                 FROM items LEFT JOIN bodies ON bodies.item_id = items.id
+                 FROM items
+                 JOIN feeds ON feeds.id = items.feed_id
+                 LEFT JOIN bodies ON bodies.item_id = items.id
                  WHERE items.id = ?1",
                 [item_id],
                 |row| {
                     Ok(Body {
                         item_id: row.get(0)?,
-                        title: row.get(1)?,
-                        url: row.get(2)?,
-                        content: row.get(3)?,
-                        format: row.get(4)?,
-                        source: row.get(5)?,
+                        feed_id: row.get(1)?,
+                        feed_title: row.get(2)?,
+                        title: row.get(3)?,
+                        url: row.get(4)?,
+                        author: row.get(5)?,
+                        published: row.get(6)?,
+                        read: row.get::<_, i64>(7)? != 0,
+                        starred: row.get::<_, i64>(8)? != 0,
+                        content: row.get(9)?,
+                        format: row.get(10)?,
+                        source: row.get(11)?,
                     })
                 },
             )
@@ -563,14 +706,75 @@ fn parse_stamp(value: String) -> Option<DateTime<Utc>> {
 fn read_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
     Ok(Item {
         id: row.get(0)?,
-        feed_title: row.get(1)?,
-        title: row.get(2)?,
-        url: row.get(3)?,
-        author: row.get(4)?,
-        published: row.get(5)?,
-        read: row.get::<_, i64>(6)? != 0,
-        starred: row.get::<_, i64>(7)? != 0,
+        feed_id: row.get(1)?,
+        feed_title: row.get(2)?,
+        title: row.get(3)?,
+        url: row.get(4)?,
+        author: row.get(5)?,
+        published: row.get(6)?,
+        read: row.get::<_, i64>(7)? != 0,
+        starred: row.get::<_, i64>(8)? != 0,
+        snippet: None,
+        score: None,
+        duplicates: 0,
     })
+}
+
+/// The same story often arrives from several feeds under different ids, since
+/// an id is namespaced by the feed it came from. Matching on the cleaned link,
+/// then on the exact title, catches both the syndicated copy and the aggregator
+/// that rewrites every link.
+fn collapse_duplicates(items: Vec<Item>, query: &Query) -> Vec<Item> {
+    if !query.dedupe {
+        return items;
+    }
+    let mut first_seen: HashMap<String, usize> = HashMap::new();
+    let mut out: Vec<Item> = Vec::new();
+    for item in items {
+        let keys = dedupe_keys(&item);
+        match keys.iter().find_map(|key| first_seen.get(key).copied()) {
+            Some(index) => out[index].duplicates += 1,
+            None => {
+                for key in keys {
+                    first_seen.insert(key, out.len());
+                }
+                out.push(item);
+            }
+        }
+    }
+    out
+}
+
+fn dedupe_keys(item: &Item) -> Vec<String> {
+    let mut keys = Vec::new();
+    if let Some(url) = &item.url {
+        keys.push(format!("url:{}", crate::identity::normalize_url(url)));
+    }
+    if let Some(title) = &item.title {
+        let title = title.trim().to_lowercase();
+        if !title.is_empty() {
+            keys.push(format!("title:{title}"));
+        }
+    }
+    keys
+}
+
+/// Keeps the newest `per_feed` items from each feed, in the order they were
+/// already sorted, then trims to the requested limit.
+fn cap_per_feed(items: Vec<Item>, query: &Query) -> Vec<Item> {
+    let Some(per_feed) = query.per_feed else {
+        return items;
+    };
+    let mut taken: HashMap<i64, usize> = HashMap::new();
+    items
+        .into_iter()
+        .filter(|item| {
+            let count = taken.entry(item.feed_id).or_default();
+            *count += 1;
+            *count <= per_feed
+        })
+        .take(query.limit)
+        .collect()
 }
 
 fn now() -> String {
@@ -586,6 +790,18 @@ mod tests {
     use super::*;
     use crate::identity::IdSource;
 
+    /// Every item, regardless of read state, for tests that just want rows.
+    fn any() -> Query {
+        Query {
+            unread_only: false,
+            ..Query::default()
+        }
+    }
+
+    fn add(store: &Store, url: &str, folder: Option<&str>) -> i64 {
+        store.upsert_feed(&sub(url, folder), false).unwrap().0
+    }
+
     fn sub(url: &str, folder: Option<&str>) -> Subscription {
         Subscription {
             url: url.into(),
@@ -597,8 +813,8 @@ mod tests {
     #[test]
     fn upsert_is_idempotent() {
         let store = Store::open_in_memory().unwrap();
-        let first = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
-        let again = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let first = add(&store, "https://a.com/feed", None);
+        let again = add(&store, "https://a.com/feed", None);
         assert_eq!(first, again);
         assert_eq!(store.feeds().unwrap().len(), 1);
     }
@@ -621,7 +837,7 @@ mod tests {
     #[test]
     fn only_unseen_items_count_as_new() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
 
         let first = vec![item("a", "One"), item("b", "Two")];
         assert_eq!(store.save_items(feed, &first).unwrap(), 2);
@@ -629,6 +845,151 @@ mod tests {
         let second = vec![item("b", "Two"), item("c", "Three")];
         assert_eq!(store.save_items(feed, &second).unwrap(), 1);
         assert_eq!(store.unread_count().unwrap(), 3);
+    }
+
+    #[test]
+    fn a_since_filter_hides_older_items() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        let mut old = item("old", "Last year");
+        old.published = Some(Utc::now() - chrono::Duration::days(400));
+        store
+            .save_items(feed, &[old, item("new", "Today")])
+            .unwrap();
+
+        let query = Query {
+            since: Some(Utc::now() - chrono::Duration::days(1)),
+            ..Query::default()
+        };
+        let found = store.items(&query).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "new");
+        assert_eq!(store.count(&query).unwrap(), 1);
+    }
+
+    #[test]
+    fn starred_only_returns_what_was_starred() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        store
+            .save_items(feed, &[item("a", "One"), item("b", "Two")])
+            .unwrap();
+        store.set_flag(&["b".to_string()], Flag::Star).unwrap();
+
+        let query = Query {
+            starred_only: true,
+            unread_only: false,
+            ..Query::default()
+        };
+        let found = store.items(&query).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "b");
+    }
+
+    #[test]
+    fn one_busy_feed_cannot_fill_the_page() {
+        let mut store = Store::open_in_memory().unwrap();
+        let busy = add(&store, "https://busy.com/feed", None);
+        let quiet = add(&store, "https://quiet.com/feed", None);
+        let flood: Vec<_> = (0..10)
+            .map(|n| item(&format!("busy{n}"), "Flood"))
+            .collect();
+        store.save_items(busy, &flood).unwrap();
+        store.save_items(quiet, &[item("quiet1", "Rare")]).unwrap();
+
+        let query = Query {
+            per_feed: Some(2),
+            limit: 10,
+            ..Query::default()
+        };
+        let found = store.items(&query).unwrap();
+        assert_eq!(found.len(), 3);
+        assert_eq!(found.iter().filter(|i| i.feed_id == busy).count(), 2);
+        assert_eq!(found.iter().filter(|i| i.feed_id == quiet).count(), 1);
+    }
+
+    #[test]
+    fn a_snippet_is_plain_text_and_bounded() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        let mut long = item("a", "One");
+        long.content = Some(format!("<p>{}</p>", "word ".repeat(200)));
+        store.save_items(feed, &[long]).unwrap();
+
+        let query = Query {
+            snippet: Some(40),
+            ..Query::default()
+        };
+        let snippet = store.items(&query).unwrap()[0].snippet.clone().unwrap();
+        assert!(!snippet.contains('<'));
+        assert!(snippet.chars().count() <= 41);
+    }
+
+    #[test]
+    fn search_can_be_scoped_and_comes_back_ranked() {
+        let mut store = Store::open_in_memory().unwrap();
+        let rust = add(&store, "https://a.com/feed", Some("Rust"));
+        let other = add(&store, "https://b.com/feed", Some("Go"));
+        store
+            .save_items(rust, &[item("a", "Async Rust in practice")])
+            .unwrap();
+        store
+            .save_items(other, &[item("b", "Rust versus Go")])
+            .unwrap();
+
+        let scoped = Query {
+            unread_only: false,
+            folder: Some("Rust".into()),
+            ..Query::default()
+        };
+        let found = store.search("rust", &scoped).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "a");
+        assert!(found[0].score.is_some());
+        assert!(found[0].snippet.is_some());
+    }
+
+    #[test]
+    fn one_story_from_two_feeds_collapses_into_one_row() {
+        let mut store = Store::open_in_memory().unwrap();
+        let one = add(&store, "https://a.com/feed", None);
+        let two = add(&store, "https://b.com/feed", None);
+
+        let mut here = item("here", "GPT-6 Astra announced");
+        here.url = Some("https://openai.com/astra".into());
+        let mut there = item("there", "GPT-6 Astra announced");
+        there.url = Some("https://openai.com/astra?utm_source=rss".into());
+        store.save_items(one, &[here]).unwrap();
+        store.save_items(two, &[there]).unwrap();
+
+        let plain = store.items(&Query::default()).unwrap();
+        assert_eq!(plain.len(), 2);
+
+        let merged = store
+            .items(&Query {
+                dedupe: true,
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].duplicates, 1);
+    }
+
+    #[test]
+    fn deduping_keeps_genuinely_different_stories_apart() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        store
+            .save_items(feed, &[item("a", "One"), item("b", "Two")])
+            .unwrap();
+
+        let merged = store
+            .items(&Query {
+                dedupe: true,
+                ..Query::default()
+            })
+            .unwrap();
+        assert_eq!(merged.len(), 2);
     }
 
     #[test]
@@ -643,9 +1004,7 @@ mod tests {
     #[test]
     fn stats_count_what_is_there() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store
-            .upsert_feed(&sub("https://a.com/feed", Some("Tech")))
-            .unwrap();
+        let feed = add(&store, "https://a.com/feed", Some("Tech"));
         store
             .save_items(feed, &[item("a", "One"), item("b", "Two")])
             .unwrap();
@@ -661,9 +1020,7 @@ mod tests {
     #[test]
     fn listing_defaults_to_unread_and_reports_the_total() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store
-            .upsert_feed(&sub("https://a.com/feed", Some("Tech")))
-            .unwrap();
+        let feed = add(&store, "https://a.com/feed", Some("Tech"));
         store
             .save_items(feed, &[item("a", "One"), item("b", "Two")])
             .unwrap();
@@ -683,7 +1040,7 @@ mod tests {
     #[test]
     fn an_extracted_body_replaces_the_feed_one_and_survives_a_refresh() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         let mut teaser = item("a", "One");
         teaser.content = Some("<p>Teaser</p>".into());
         store.save_items(feed, &[teaser.clone()]).unwrap();
@@ -701,7 +1058,7 @@ mod tests {
     #[test]
     fn only_unscraped_items_are_queued_for_extraction() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         store
             .save_items(feed, &[item("a", "One"), item("b", "Two")])
             .unwrap();
@@ -715,7 +1072,7 @@ mod tests {
     #[test]
     fn a_feed_supplied_body_is_stored_and_read_back() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         let mut with_body = item("a", "One");
         with_body.content = Some("<p>Hello</p>".into());
         store.save_items(feed, &[with_body]).unwrap();
@@ -728,7 +1085,7 @@ mod tests {
     #[test]
     fn an_item_without_a_body_falls_back_to_its_summary() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         let mut summarised = item("a", "One");
         summarised.summary = Some("Just a teaser".into());
         store.save_items(feed, &[summarised]).unwrap();
@@ -741,7 +1098,7 @@ mod tests {
     #[test]
     fn search_finds_items_by_title() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         store
             .save_items(
                 feed,
@@ -749,7 +1106,7 @@ mod tests {
             )
             .unwrap();
 
-        let found = store.search("rust", 10).unwrap();
+        let found = store.search("rust", &any()).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id, "a");
     }
@@ -757,7 +1114,7 @@ mod tests {
     #[test]
     fn the_index_follows_an_edited_title() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         store
             .save_items(feed, &[item("a", "Draft heading")])
             .unwrap();
@@ -765,19 +1122,15 @@ mod tests {
             .save_items(feed, &[item("a", "Published heading")])
             .unwrap();
 
-        assert!(store.search("draft", 10).unwrap().is_empty());
-        assert_eq!(store.search("published", 10).unwrap().len(), 1);
+        assert!(store.search("draft", &any()).unwrap().is_empty());
+        assert_eq!(store.search("published", &any()).unwrap().len(), 1);
     }
 
     #[test]
     fn a_folder_filter_only_matches_its_own_feeds() {
         let mut store = Store::open_in_memory().unwrap();
-        let tech = store
-            .upsert_feed(&sub("https://a.com/feed", Some("Tech")))
-            .unwrap();
-        let news = store
-            .upsert_feed(&sub("https://b.com/feed", Some("News")))
-            .unwrap();
+        let tech = add(&store, "https://a.com/feed", Some("Tech"));
+        let news = add(&store, "https://b.com/feed", Some("News"));
         store.save_items(tech, &[item("a", "One")]).unwrap();
         store.save_items(news, &[item("b", "Two")]).unwrap();
 
@@ -793,7 +1146,7 @@ mod tests {
     #[test]
     fn marking_something_twice_changes_nothing_the_second_time() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         store.save_items(feed, &[item("a", "One")]).unwrap();
 
         let ids = vec!["a".to_string()];
@@ -805,7 +1158,7 @@ mod tests {
     #[test]
     fn an_edited_item_keeps_its_read_flag() {
         let mut store = Store::open_in_memory().unwrap();
-        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
         store.save_items(feed, &[item("a", "Draft")]).unwrap();
         store
             .conn
@@ -825,12 +1178,78 @@ mod tests {
     }
 
     #[test]
-    fn a_reimport_can_add_a_folder_but_not_erase_one() {
+    fn a_reimport_leaves_an_existing_title_and_folder_alone() {
         let store = Store::open_in_memory().unwrap();
-        store
-            .upsert_feed(&sub("https://a.com/feed", Some("Tech")))
+        add(&store, "https://a.com/feed", Some("Tech"));
+
+        let renamed = Subscription {
+            url: "https://a.com/feed".into(),
+            title: Some("Renamed".into()),
+            folder: Some("Elsewhere".into()),
+        };
+        let (_, outcome) = store.upsert_feed(&renamed, false).unwrap();
+
+        assert_eq!(outcome, Upsert::Unchanged);
+        let feed = &store.feeds().unwrap()[0];
+        assert_eq!(feed.title.as_deref(), Some("Title"));
+        assert_eq!(feed.folder.as_deref(), Some("Tech"));
+    }
+
+    #[test]
+    fn overwriting_a_feed_label_has_to_be_asked_for() {
+        let store = Store::open_in_memory().unwrap();
+        add(&store, "https://a.com/feed", Some("Tech"));
+
+        let renamed = Subscription {
+            url: "https://a.com/feed".into(),
+            title: Some("Renamed".into()),
+            folder: Some("Elsewhere".into()),
+        };
+        let (_, outcome) = store.upsert_feed(&renamed, true).unwrap();
+
+        assert_eq!(outcome, Upsert::Updated);
+        let feed = &store.feeds().unwrap()[0];
+        assert_eq!(feed.title.as_deref(), Some("Renamed"));
+        assert_eq!(feed.folder.as_deref(), Some("Elsewhere"));
+    }
+
+    #[test]
+    fn a_new_feed_reports_that_it_was_added() {
+        let store = Store::open_in_memory().unwrap();
+        let (_, first) = store
+            .upsert_feed(&sub("https://a.com/feed", None), false)
             .unwrap();
-        store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
-        assert_eq!(store.feeds().unwrap()[0].folder.as_deref(), Some("Tech"));
+        let (_, again) = store
+            .upsert_feed(&sub("https://a.com/feed", None), false)
+            .unwrap();
+        assert_eq!(first, Upsert::Added);
+        assert_eq!(again, Upsert::Unchanged);
+    }
+
+    #[test]
+    fn removing_a_feed_takes_its_items_bodies_and_index_with_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        store
+            .save_items(feed, &[item("a", "Unmistakable")])
+            .unwrap();
+        store.save_body("a", "<p>text</p>", "extracted").unwrap();
+
+        assert!(store.remove_feed(feed).unwrap());
+        assert!(!store.remove_feed(feed).unwrap());
+
+        let stats = store.stats().unwrap();
+        assert_eq!((stats.feeds, stats.items), (0, 0));
+        assert!(store.body("a").unwrap().is_none());
+        assert!(store.search("Unmistakable", &any()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn folders_are_listed_for_a_caller_that_needs_valid_names() {
+        let store = Store::open_in_memory().unwrap();
+        add(&store, "https://a.com/feed", Some("Tech"));
+        add(&store, "https://b.com/feed", Some("News"));
+        add(&store, "https://c.com/feed", None);
+        assert_eq!(store.folders().unwrap(), vec!["News", "Tech"]);
     }
 }

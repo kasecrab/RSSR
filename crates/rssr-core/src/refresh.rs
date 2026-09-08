@@ -17,6 +17,8 @@ pub struct Options {
     /// Leave a feed alone if it was fetched more recently than this. Skipped
     /// feeds cost no request at all, not even a conditional one.
     pub max_age: Option<Duration>,
+    /// Refresh only this feed.
+    pub only_feed: Option<i64>,
 }
 
 impl Default for Options {
@@ -24,6 +26,7 @@ impl Default for Options {
         Options {
             workers: 16,
             max_age: None,
+            only_feed: None,
         }
     }
 }
@@ -78,6 +81,9 @@ pub fn refresh(store: &mut Store, fetcher: &Fetcher, options: Options) -> Result
     let mut summary = Summary::default();
     let mut due = Vec::new();
     for feed in store.feeds()? {
+        if options.only_feed.is_some_and(|only| only != feed.id) {
+            continue;
+        }
         match fresh_for(&feed, options.max_age) {
             Some(age_secs) => summary.outcomes.push(FeedOutcome {
                 url: feed.url,
@@ -158,9 +164,13 @@ pub fn extract_pending(
     fetcher: &Fetcher,
     per_feed: usize,
     workers: usize,
+    only_feed: Option<i64>,
 ) -> Result<ExtractSummary> {
     let mut pending: Vec<(String, String)> = Vec::new();
     for feed in store.feeds()? {
+        if only_feed.is_some_and(|only| only != feed.id) {
+            continue;
+        }
         if feed.full_content {
             pending.extend(store.awaiting_extraction(feed.id, per_feed)?);
         }
@@ -349,11 +359,14 @@ mod tests {
 
     fn subscribe(store: &mut Store, url: &str) {
         store
-            .upsert_feed(&Subscription {
-                url: url.into(),
-                title: None,
-                folder: None,
-            })
+            .upsert_feed(
+                &Subscription {
+                    url: url.into(),
+                    title: None,
+                    folder: None,
+                },
+                false,
+            )
             .unwrap();
     }
 
@@ -443,6 +456,26 @@ mod tests {
         let second = refresh(&mut store, &fetcher, options).unwrap();
         assert!(matches!(second.outcomes[0].status, Status::Skipped { .. }));
         assert_eq!(second.outcomes[0].elapsed_ms, 0);
+    }
+
+    #[test]
+    fn refreshing_one_feed_leaves_the_others_alone() {
+        let mut store = Store::open_in_memory().unwrap();
+        subscribe(&mut store, &serve(RSS, "200 OK"));
+        subscribe(&mut store, &serve(RSS, "200 OK"));
+        let only = store.feeds().unwrap()[0].id;
+
+        let summary = refresh(
+            &mut store,
+            &Fetcher::new(),
+            Options {
+                only_feed: Some(only),
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(summary.outcomes.len(), 1);
+        assert_eq!(summary.new_items, 1);
     }
 
     #[test]
