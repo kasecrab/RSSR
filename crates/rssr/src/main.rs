@@ -276,11 +276,16 @@ fn mark(store: &Store, ids: &[String], flag: Flag, as_json: bool) -> Result<Exit
     Ok(ExitCode::SUCCESS)
 }
 
+/// Clips to `width` printed characters, ellipsis included, so columns line up.
 fn truncate(value: &str, width: usize) -> String {
-    match value.char_indices().nth(width) {
-        Some((cut, _)) => format!("{}…", &value[..cut]),
-        None => value.to_string(),
+    if value.chars().count() <= width {
+        return value.to_string();
     }
+    let cut = value
+        .char_indices()
+        .nth(width.saturating_sub(1))
+        .map_or(value.len(), |(index, _)| index);
+    format!("{}…", &value[..cut])
 }
 
 fn import(store: &Store, file: &PathBuf, as_json: bool) -> Result<ExitCode> {

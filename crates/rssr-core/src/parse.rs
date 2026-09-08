@@ -79,7 +79,10 @@ fn item(feed_url: &str, entry: Entry) -> ParsedItem {
         title,
         author: entry.authors.into_iter().next().map(|person| person.name),
         summary: entry.summary.and_then(text),
-        content: entry.content.and_then(|content| content.body).filter(|b| !b.is_empty()),
+        content: entry
+            .content
+            .and_then(|content| content.body)
+            .filter(|b| !b.is_empty()),
         published,
         updated,
     }

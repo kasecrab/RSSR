@@ -185,8 +185,18 @@ mod tests {
 
     #[test]
     fn a_guid_that_is_not_a_url_is_left_alone() {
-        let a = item_id("https://f.com/rss", Some("tag:f.com,2026:post#1"), None, "x");
-        let b = item_id("https://f.com/rss", Some("tag:f.com,2026:post#7"), None, "x");
+        let a = item_id(
+            "https://f.com/rss",
+            Some("tag:f.com,2026:post#1"),
+            None,
+            "x",
+        );
+        let b = item_id(
+            "https://f.com/rss",
+            Some("tag:f.com,2026:post#7"),
+            None,
+            "x",
+        );
         assert_ne!(a.0, b.0);
     }
 
