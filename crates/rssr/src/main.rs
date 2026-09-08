@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use rssr_core::refresh::{self, Options, Status};
+use rssr_core::store::{Flag, Query};
 use rssr_core::{Fetcher, Result, Store, opml};
 use serde_json::json;
 
@@ -36,6 +37,44 @@ enum Command {
     },
     /// List subscribed feeds.
     Feeds,
+    /// List items, newest first.
+    List {
+        /// Include items already read.
+        #[arg(long)]
+        all: bool,
+        #[arg(long, value_name = "ID")]
+        feed: Option<i64>,
+        #[arg(long, value_name = "NAME")]
+        folder: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Mark items read, unread, starred or unstarred.
+    Mark {
+        #[arg(value_enum)]
+        flag: MarkFlag,
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum MarkFlag {
+    Read,
+    Unread,
+    Star,
+    Unstar,
+}
+
+impl From<MarkFlag> for Flag {
+    fn from(flag: MarkFlag) -> Self {
+        match flag {
+            MarkFlag::Read => Flag::Read,
+            MarkFlag::Unread => Flag::Unread,
+            MarkFlag::Star => Flag::Star,
+            MarkFlag::Unstar => Flag::Unstar,
+        }
+    }
 }
 
 fn main() -> ExitCode {
@@ -62,6 +101,79 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             do_refresh(&mut store, Options { workers: *workers }, cli.json)
         }
         Command::Feeds => feeds(&store, cli.json),
+        Command::List {
+            all,
+            feed,
+            folder,
+            limit,
+        } => list(
+            &store,
+            Query {
+                unread_only: !all,
+                feed_id: *feed,
+                folder: folder.clone(),
+                limit: *limit,
+            },
+            cli.json,
+        ),
+        Command::Mark { flag, ids } => mark(&store, ids, (*flag).into(), cli.json),
+    }
+}
+
+fn list(store: &Store, query: Query, as_json: bool) -> Result<ExitCode> {
+    let items = store.items(&query)?;
+    let total = store.count(&query)?;
+
+    if as_json {
+        let rows: Vec<_> = items
+            .iter()
+            .map(|item| {
+                json!({
+                    "id": item.id,
+                    "feed": item.feed_title,
+                    "title": item.title,
+                    "url": item.url,
+                    "author": item.author,
+                    "published": item.published,
+                    "read": item.read,
+                    "starred": item.starred,
+                })
+            })
+            .collect();
+        print(&json!({ "count": rows.len(), "total": total, "items": rows }));
+    } else if items.is_empty() {
+        println!("nothing to read");
+    } else {
+        for item in &items {
+            println!(
+                "{}  {}{}  {:<14} {:<10} {}",
+                item.id,
+                if item.read { " " } else { "*" },
+                if item.starred { "s" } else { " " },
+                truncate(item.feed_title.as_deref().unwrap_or("-"), 14),
+                item.published.as_deref().unwrap_or("").get(..10).unwrap_or(""),
+                item.title.as_deref().unwrap_or("(untitled)"),
+            );
+        }
+        println!("{} of {total}", items.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn mark(store: &Store, ids: &[String], flag: Flag, as_json: bool) -> Result<ExitCode> {
+    let changed = store.set_flag(ids, flag)?;
+    if as_json {
+        print(&json!({ "matched": changed, "requested": ids.len() }));
+    } else {
+        println!("{changed} of {} items updated", ids.len());
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn truncate(value: &str, width: usize) -> String {
+    match value.char_indices().nth(width) {
+        Some((cut, _)) => format!("{}…", &value[..cut]),
+        None => value.to_string(),
     }
 }
 
