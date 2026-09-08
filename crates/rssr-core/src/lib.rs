@@ -1,6 +1,6 @@
-mod error;
 pub mod content;
 pub mod duration;
+mod error;
 pub mod extract;
 pub mod fetch;
 pub mod identity;

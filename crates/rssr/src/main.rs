@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use rssr_core::refresh::{self, Options, Status};
 use rssr_core::store::{Flag, Item, Query};
-use rssr_core::{Fetcher, Result, Store, content, duration, fetch, opml};
+use rssr_core::{Fetcher, Result, Store, content, duration, extract, fetch, opml};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -43,6 +43,18 @@ enum Command {
     },
     /// List subscribed feeds.
     Feeds,
+    /// Change a feed's settings.
+    Feed {
+        id: i64,
+        /// Scrape each item's page because this feed only publishes a teaser.
+        #[arg(long, value_name = "on|off")]
+        full_content: Toggle,
+    },
+    /// Scrape the full article for items whose feed only sent a teaser.
+    Extract {
+        #[arg(required = true)]
+        ids: Vec<String>,
+    },
     /// List items, newest first.
     List {
         /// Include items already read.
@@ -76,6 +88,12 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Toggle {
+    On,
+    Off,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -139,6 +157,10 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             )
         }
         Command::Feeds => feeds(&store, cli.json),
+        Command::Feed { id, full_content } => {
+            set_full_content(&store, *id, matches!(full_content, Toggle::On), cli.json)
+        }
+        Command::Extract { ids } => extract_items(&store, ids, cli.json),
         Command::List {
             all,
             feed,
@@ -209,6 +231,62 @@ fn show(items: &[Item]) {
             item.title.as_deref().unwrap_or("(untitled)"),
         );
     }
+}
+
+fn set_full_content(store: &Store, id: i64, on: bool, as_json: bool) -> Result<ExitCode> {
+    if !store.set_full_content(id, on)? {
+        eprintln!("no such feed: {id}");
+        return Ok(ExitCode::from(1));
+    }
+    if as_json {
+        print(&json!({ "feed": id, "full_content": on }));
+    } else {
+        println!("feed {id}: full content {}", if on { "on" } else { "off" });
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn extract_items(store: &Store, ids: &[String], as_json: bool) -> Result<ExitCode> {
+    let fetcher = Fetcher::new();
+    let mut results = Vec::new();
+    let mut failed = 0;
+
+    for id in ids {
+        let Some(url) = store.item_url(id)? else {
+            failed += 1;
+            results.push(json!({ "id": id, "ok": false, "error": "no such item or no link" }));
+            continue;
+        };
+        match extract::from_url(&fetcher, &url) {
+            Ok(article) => {
+                store.save_body(id, &article.content, "extracted")?;
+                results.push(json!({ "id": id, "ok": true, "chars": article.chars, "url": url }));
+            }
+            Err(e) => {
+                failed += 1;
+                results.push(json!({ "id": id, "ok": false, "error": e.to_string() }));
+            }
+        }
+    }
+
+    if as_json {
+        print(&json!({ "count": results.len(), "failed": failed, "items": results }));
+    } else {
+        for result in &results {
+            match result["ok"].as_bool() {
+                Some(true) => println!("{} {} chars", result["id"], result["chars"]),
+                _ => eprintln!("{}: {}", result["id"], result["error"]),
+            }
+        }
+    }
+
+    Ok(if failed == 0 {
+        ExitCode::SUCCESS
+    } else if failed == ids.len() {
+        ExitCode::from(4)
+    } else {
+        ExitCode::from(3)
+    })
 }
 
 const PREVIEW_CHARS: usize = 4000;

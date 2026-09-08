@@ -90,6 +90,8 @@ pub struct Feed {
     pub etag: Option<String>,
     pub last_modified: Option<String>,
     pub fetched_at: Option<DateTime<Utc>>,
+    /// Scrape each item's page because this feed only publishes a teaser.
+    pub full_content: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +156,11 @@ impl Flag {
 
 /// Filters are written as `?n IS NULL OR ...` so one prepared statement
 /// serves every combination instead of pasting SQL together at runtime.
-const LATEST_VERSION: i64 = 2;
+const SCHEMA_V3: &str = r#"
+ALTER TABLE feeds ADD COLUMN full_content INTEGER NOT NULL DEFAULT 0;
+"#;
+
+const LATEST_VERSION: i64 = 3;
 
 const FILTER: &str = "WHERE (?1 = 0 OR items.read = 0)
               AND (?2 IS NULL OR items.feed_id = ?2)
@@ -193,7 +199,7 @@ impl Store {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        for (target, statements) in [(1, SCHEMA_V1), (2, SCHEMA_V2)] {
+        for (target, statements) in [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)] {
             if version < target {
                 self.conn.execute_batch(statements)?;
             }
@@ -228,7 +234,7 @@ impl Store {
 
     pub fn feeds(&self) -> Result<Vec<Feed>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, url, title, folder, etag, last_modified, fetched_at
+            "SELECT id, url, title, folder, etag, last_modified, fetched_at, full_content
              FROM feeds ORDER BY folder IS NULL, folder, title, url",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -240,6 +246,7 @@ impl Store {
                 etag: row.get(4)?,
                 last_modified: row.get(5)?,
                 fetched_at: row.get::<_, Option<String>>(6)?.and_then(parse_stamp),
+                full_content: row.get::<_, i64>(7)? != 0,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -399,6 +406,53 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    pub fn set_full_content(&self, feed_id: i64, on: bool) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE feeds SET full_content = ?2 WHERE id = ?1",
+            params![feed_id, on as i64],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn save_body(&self, item_id: &str, content: &str, source: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO bodies (item_id, content, format, source, fetched_at)
+             VALUES (?1, ?2, 'html', ?3, ?4)
+             ON CONFLICT(item_id) DO UPDATE SET
+                 content    = excluded.content,
+                 source     = excluded.source,
+                 fetched_at = excluded.fetched_at",
+            params![item_id, content, source, now()],
+        )?;
+        Ok(())
+    }
+
+    /// Items on a feed whose page has not been scraped yet, newest first.
+    pub fn awaiting_extraction(&self, feed_id: i64, limit: usize) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT items.id, items.url
+             FROM items LEFT JOIN bodies ON bodies.item_id = items.id
+             WHERE items.feed_id = ?1
+               AND items.url IS NOT NULL
+               AND (bodies.source IS NULL OR bodies.source <> 'extracted')
+             ORDER BY COALESCE(items.published, items.updated, items.seen_at) DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![feed_id, limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn item_url(&self, item_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT url FROM items WHERE id = ?1", [item_id], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
     pub fn body(&self, item_id: &str) -> Result<Option<Body>> {
         Ok(self
             .conn
@@ -546,6 +600,38 @@ mod tests {
             ..Query::default()
         };
         assert_eq!(store.count(&all).unwrap(), 2);
+    }
+
+    #[test]
+    fn an_extracted_body_replaces_the_feed_one_and_survives_a_refresh() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let mut teaser = item("a", "One");
+        teaser.content = Some("<p>Teaser</p>".into());
+        store.save_items(feed, &[teaser.clone()]).unwrap();
+
+        store
+            .save_body("a", "<p>The whole article</p>", "extracted")
+            .unwrap();
+        store.save_items(feed, &[teaser]).unwrap();
+
+        let body = store.body("a").unwrap().unwrap();
+        assert_eq!(body.content, "<p>The whole article</p>");
+        assert_eq!(body.source, "extracted");
+    }
+
+    #[test]
+    fn only_unscraped_items_are_queued_for_extraction() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        store
+            .save_items(feed, &[item("a", "One"), item("b", "Two")])
+            .unwrap();
+        store.save_body("a", "<p>Done</p>", "extracted").unwrap();
+
+        let queued = store.awaiting_extraction(feed, 10).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].0, "b");
     }
 
     #[test]
