@@ -4,7 +4,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use rssr_core::refresh::{self, Options, Status};
 use rssr_core::store::{Flag, Item, Query};
-use rssr_core::{Fetcher, Result, Store, opml};
+use rssr_core::{Fetcher, Result, Store, content, opml};
 use serde_json::json;
 
 #[derive(Parser)]
@@ -48,6 +48,14 @@ enum Command {
         folder: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+    },
+    /// Print one or more items as text. Reading never marks anything read.
+    Read {
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Print the whole body instead of the first few thousand characters.
+        #[arg(long)]
+        full: bool,
     },
     /// Full-text search across every stored item.
     Search {
@@ -122,6 +130,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             },
             cli.json,
         ),
+        Command::Read { ids, full } => read(&store, ids, *full, cli.json),
         Command::Search { text, limit } => search(&store, text, *limit, cli.json),
         Command::Mark { flag, ids } => mark(&store, ids, (*flag).into(), cli.json),
     }
@@ -175,6 +184,72 @@ fn show(items: &[Item]) {
                 .unwrap_or(""),
             item.title.as_deref().unwrap_or("(untitled)"),
         );
+    }
+}
+
+const PREVIEW_CHARS: usize = 4000;
+
+fn read(store: &Store, ids: &[String], full: bool, as_json: bool) -> Result<ExitCode> {
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+
+    for id in ids {
+        match store.body(id)? {
+            Some(body) => found.push(body),
+            None => missing.push(id.clone()),
+        }
+    }
+
+    if as_json {
+        let items: Vec<_> = found
+            .iter()
+            .map(|body| {
+                let text = content::to_markdown(&body.content);
+                let (text, truncated) = clip(&text, full);
+                json!({
+                    "id": body.item_id,
+                    "title": body.title,
+                    "url": body.url,
+                    "source": body.source,
+                    "tokens_estimate": content::estimate_tokens(&text),
+                    "truncated": truncated,
+                    "content": text,
+                })
+            })
+            .collect();
+        print(&json!({ "count": items.len(), "items": items, "missing": missing }));
+    } else {
+        for body in &found {
+            println!("{}", body.title.as_deref().unwrap_or("(untitled)"));
+            if let Some(url) = &body.url {
+                println!("{url}");
+            }
+            let (text, truncated) = clip(&content::to_markdown(&body.content), full);
+            println!("\n{text}");
+            if truncated {
+                println!("\n[truncated, rerun with --full]");
+            }
+            println!();
+        }
+        for id in &missing {
+            eprintln!("no such item: {id}");
+        }
+    }
+
+    Ok(if found.is_empty() && !missing.is_empty() {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+fn clip(text: &str, full: bool) -> (String, bool) {
+    if full {
+        return (text.to_string(), false);
+    }
+    match text.char_indices().nth(PREVIEW_CHARS) {
+        Some((cut, _)) => (text[..cut].to_string(), true),
+        None => (text.to_string(), false),
     }
 }
 

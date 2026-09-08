@@ -104,6 +104,16 @@ pub struct Item {
 }
 
 #[derive(Debug, Clone)]
+pub struct Body {
+    pub item_id: String,
+    pub title: Option<String>,
+    pub url: Option<String>,
+    pub content: String,
+    pub format: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct Query {
     pub unread_only: bool,
     pub feed_id: Option<i64>,
@@ -292,6 +302,12 @@ impl Store {
                      url = ?2, title = ?3, author = ?4, summary = ?5, updated = ?6
                  WHERE id = ?1",
             )?;
+            let mut body = tx.prepare(
+                "INSERT INTO bodies (item_id, content, format, source, fetched_at)
+                 VALUES (?1, ?2, 'html', 'feed', ?3)
+                 ON CONFLICT(item_id) DO UPDATE SET content = excluded.content
+                 WHERE bodies.source = 'feed'",
+            )?;
 
             for item in items {
                 let published = item.published.map(stamp);
@@ -320,6 +336,9 @@ impl Store {
                     ])?;
                 } else {
                     new += 1;
+                }
+                if let Some(content) = &item.content {
+                    body.execute(params![item.id, content, seen_at])?;
                 }
             }
         }
@@ -376,6 +395,31 @@ impl Store {
         )?;
         let rows = stmt.query_map(params![text, limit as i64], read_item)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn body(&self, item_id: &str) -> Result<Option<Body>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT items.id, items.title, items.url,
+                        COALESCE(bodies.content, items.summary, ''),
+                        COALESCE(bodies.format, 'html'),
+                        COALESCE(bodies.source, 'summary')
+                 FROM items LEFT JOIN bodies ON bodies.item_id = items.id
+                 WHERE items.id = ?1",
+                [item_id],
+                |row| {
+                    Ok(Body {
+                        item_id: row.get(0)?,
+                        title: row.get(1)?,
+                        url: row.get(2)?,
+                        content: row.get(3)?,
+                        format: row.get(4)?,
+                        source: row.get(5)?,
+                    })
+                },
+            )
+            .optional()?)
     }
 
     pub fn set_flag(&self, ids: &[String], flag: Flag) -> Result<usize> {
@@ -494,6 +538,32 @@ mod tests {
             ..Query::default()
         };
         assert_eq!(store.count(&all).unwrap(), 2);
+    }
+
+    #[test]
+    fn a_feed_supplied_body_is_stored_and_read_back() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let mut with_body = item("a", "One");
+        with_body.content = Some("<p>Hello</p>".into());
+        store.save_items(feed, &[with_body]).unwrap();
+
+        let body = store.body("a").unwrap().unwrap();
+        assert_eq!(body.content, "<p>Hello</p>");
+        assert_eq!(body.source, "feed");
+    }
+
+    #[test]
+    fn an_item_without_a_body_falls_back_to_its_summary() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = store.upsert_feed(&sub("https://a.com/feed", None)).unwrap();
+        let mut summarised = item("a", "One");
+        summarised.summary = Some("Just a teaser".into());
+        store.save_items(feed, &[summarised]).unwrap();
+
+        let body = store.body("a").unwrap().unwrap();
+        assert_eq!(body.content, "Just a teaser");
+        assert_eq!(body.source, "summary");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+pub mod content;
 mod error;
 pub mod fetch;
 pub mod identity;
