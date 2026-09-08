@@ -100,6 +100,10 @@ enum Command {
         /// Include items already read.
         #[arg(long)]
         all: bool,
+        /// Only unread items. The default, except with --starred.
+        #[arg(long)]
+        unread: bool,
+        /// Only starred items. Reading does not remove them from this queue.
         #[arg(long)]
         starred: bool,
         #[arg(long, value_name = "ID")]
@@ -262,6 +266,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
         } => feed(&store, *id, *full_content, rename, folder, *remove, json),
         Command::List {
             all,
+            unread,
             starred,
             feed,
             folder,
@@ -272,7 +277,9 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             dedupe,
         } => {
             let query = Query {
-                unread_only: !all,
+                // Starring is how an item is kept for later, so reading it
+                // must not take it out of that queue.
+                unread_only: if *starred { *unread } else { !all },
                 starred_only: *starred,
                 feed_id: *feed,
                 folder: folder.clone(),
