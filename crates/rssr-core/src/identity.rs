@@ -47,7 +47,7 @@ pub fn item_id(
     fallback: &str,
 ) -> (String, IdSource) {
     let (key, source) = match (usable_guid(guid), link) {
-        (Some(guid), _) => (guid.to_string(), IdSource::Guid),
+        (Some(guid), _) => (normalize_guid(guid), IdSource::Guid),
         (None, Some(link)) => (normalize_url(link), IdSource::Link),
         (None, None) => (fallback.to_string(), IdSource::Fallback),
     };
@@ -73,6 +73,17 @@ fn usable_guid(guid: Option<&str>) -> Option<&str> {
         return None;
     }
     Some(guid)
+}
+
+/// Some publishers reuse one article across feed sections and tell them apart
+/// with a counter in the guid fragment. A URL-shaped guid gets the same
+/// cleaning as a link so those collapse to one item.
+fn normalize_guid(guid: &str) -> String {
+    if guid.starts_with("http://") || guid.starts_with("https://") {
+        normalize_url(guid)
+    } else {
+        guid.to_string()
+    }
 }
 
 fn looks_like_uuid(s: &str) -> bool {
@@ -161,6 +172,22 @@ mod tests {
             normalize_url("https://f.com/a?id=7&utm_source=rss"),
             "https://f.com/a?id=7"
         );
+    }
+
+    #[test]
+    fn one_article_listed_twice_under_fragment_guids_is_one_item() {
+        let feed = "https://feeds.bbci.co.uk/news/rss.xml";
+        let article = "https://www.bbc.co.uk/sport/football/articles/c17j5lr8kkqo";
+        let first = item_id(feed, Some(&format!("{article}#1")), Some(article), "x");
+        let seventh = item_id(feed, Some(&format!("{article}#7")), Some(article), "x");
+        assert_eq!(first.0, seventh.0);
+    }
+
+    #[test]
+    fn a_guid_that_is_not_a_url_is_left_alone() {
+        let a = item_id("https://f.com/rss", Some("tag:f.com,2026:post#1"), None, "x");
+        let b = item_id("https://f.com/rss", Some("tag:f.com,2026:post#7"), None, "x");
+        assert_ne!(a.0, b.0);
     }
 
     #[test]

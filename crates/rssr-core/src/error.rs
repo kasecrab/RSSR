@@ -25,6 +25,8 @@ impl Error {
             Error::Xml(_) => "XML_ERROR",
             Error::Http { .. } => "FEED_FETCH_FAILED",
             Error::Status { code: 429, .. } => "RATE_LIMITED",
+            Error::Status { code: 404, .. } => "FEED_NOT_FOUND",
+            Error::Status { code: 410, .. } => "FEED_GONE",
             Error::Status { .. } => "FEED_FETCH_FAILED",
             Error::Parse { .. } => "FEED_PARSE_FAILED",
             Error::Opml(_) => "OPML_INVALID",

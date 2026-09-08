@@ -309,15 +309,24 @@ fn do_refresh(store: &mut Store, options: Options, as_json: bool) -> Result<Exit
             .outcomes
             .iter()
             .map(|outcome| match &outcome.status {
-                Status::Updated { new_items } => {
-                    json!({ "url": outcome.url, "status": "updated", "new_items": new_items })
-                }
-                Status::NotModified => {
-                    json!({ "url": outcome.url, "status": "not_modified" })
-                }
-                Status::Failed { code, message } => {
-                    json!({ "url": outcome.url, "status": "failed", "code": code, "message": message })
-                }
+                Status::Updated { new_items } => json!({
+                    "url": outcome.url,
+                    "status": "updated",
+                    "new_items": new_items,
+                    "elapsed_ms": outcome.elapsed_ms,
+                }),
+                Status::NotModified => json!({
+                    "url": outcome.url,
+                    "status": "not_modified",
+                    "elapsed_ms": outcome.elapsed_ms,
+                }),
+                Status::Failed { code, message } => json!({
+                    "url": outcome.url,
+                    "status": "failed",
+                    "code": code,
+                    "message": message,
+                    "elapsed_ms": outcome.elapsed_ms,
+                }),
             })
             .collect();
         print(&json!({
@@ -362,12 +371,20 @@ fn feeds(store: &Store, as_json: bool) -> Result<ExitCode> {
             .collect();
         print(&json!({ "count": rows.len(), "feeds": rows }));
     } else {
+        let mut current: Option<&str> = None;
         for feed in &feeds {
+            let folder = feed.folder.as_deref().unwrap_or("(no folder)");
+            if current != Some(folder) {
+                if current.is_some() {
+                    println!();
+                }
+                println!("{folder}");
+                current = Some(folder);
+            }
             println!(
-                "{:<4} {:<12} {:<32} {}",
+                "  {:>3}  {:<28}  {}",
                 feed.id,
-                feed.folder.as_deref().unwrap_or("-"),
-                feed.title.as_deref().unwrap_or("-"),
+                truncate(feed.title.as_deref().unwrap_or("(untitled)"), 28),
                 feed.url
             );
         }

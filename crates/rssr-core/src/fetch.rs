@@ -19,6 +19,7 @@ pub enum Fetched {
     Body {
         bytes: Vec<u8>,
         validators: Validators,
+        content_type: Option<String>,
     },
 }
 
@@ -36,7 +37,7 @@ impl Default for Fetcher {
 impl Fetcher {
     pub fn new() -> Self {
         let config = Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(30)))
+            .timeout_global(Some(Duration::from_secs(15)))
             .timeout_connect(Some(Duration::from_secs(10)))
             .http_status_as_error(false)
             .user_agent(concat!(
@@ -81,6 +82,7 @@ impl Fetcher {
             etag: header(&resp, "etag"),
             last_modified: header(&resp, "last-modified"),
         };
+        let content_type = header(&resp, "content-type");
         let bytes = resp
             .body_mut()
             .with_config()
@@ -91,7 +93,11 @@ impl Fetcher {
                 message: e.to_string(),
             })?;
 
-        Ok(Fetched::Body { bytes, validators })
+        Ok(Fetched::Body {
+            bytes,
+            validators,
+            content_type,
+        })
     }
 }
 
@@ -139,7 +145,9 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nETag: \"abc\"\r\nLast-Modified: Wed, 01 Jan 2025 00:00:00 GMT\r\nConnection: close\r\n\r\nhello",
         );
         match Fetcher::new().get(&url, &Validators::default()).unwrap() {
-            Fetched::Body { bytes, validators } => {
+            Fetched::Body {
+                bytes, validators, ..
+            } => {
                 assert_eq!(bytes, b"hello");
                 assert_eq!(validators.etag.as_deref(), Some("\"abc\""));
                 assert!(validators.last_modified.is_some());

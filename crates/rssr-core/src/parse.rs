@@ -48,7 +48,7 @@ pub fn parse(feed_url: &str, bytes: &[u8]) -> Result<ParsedFeed> {
         .collect();
 
     Ok(ParsedFeed {
-        title: feed.title.map(text),
+        title: feed.title.and_then(text),
         site_url: primary_link(&feed.links),
         items,
     })
@@ -56,7 +56,7 @@ pub fn parse(feed_url: &str, bytes: &[u8]) -> Result<ParsedFeed> {
 
 fn item(feed_url: &str, entry: Entry) -> ParsedItem {
     let url = primary_link(&entry.links);
-    let title = entry.title.map(text);
+    let title = entry.title.and_then(text);
     let published = entry.published;
     let updated = entry.updated;
 
@@ -78,15 +78,16 @@ fn item(feed_url: &str, entry: Entry) -> ParsedItem {
         url,
         title,
         author: entry.authors.into_iter().next().map(|person| person.name),
-        summary: entry.summary.map(text),
-        content: entry.content.and_then(|content| content.body),
+        summary: entry.summary.and_then(text),
+        content: entry.content.and_then(|content| content.body).filter(|b| !b.is_empty()),
         published,
         updated,
     }
 }
 
-fn text(value: Text) -> String {
-    value.content.trim().to_string()
+fn text(value: Text) -> Option<String> {
+    let trimmed = value.content.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 fn primary_link(links: &[Link]) -> Option<String> {
@@ -153,6 +154,15 @@ mod tests {
         let a = parse("https://example.com/rss", RSS.as_bytes()).unwrap();
         let b = parse("https://example.com/rss", RSS.as_bytes()).unwrap();
         assert_eq!(a.items[0].id, b.items[0].id);
+    }
+
+    #[test]
+    fn an_empty_title_is_absent_rather_than_blank() {
+        let xml = r#"<rss version="2.0"><channel><title>F</title>
+            <item><title></title><guid>a</guid><link>https://f.com/a</link></item>
+        </channel></rss>"#;
+        let feed = parse("https://f.com/rss", xml.as_bytes()).unwrap();
+        assert_eq!(feed.items[0].title, None);
     }
 
     #[test]

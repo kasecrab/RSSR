@@ -29,6 +29,7 @@ pub enum Status {
 pub struct FeedOutcome {
     pub url: String,
     pub status: Status,
+    pub elapsed_ms: u128,
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +48,7 @@ enum Work {
 struct Done {
     feed: Feed,
     work: Work,
+    elapsed_ms: u128,
 }
 
 /// Fetches every subscribed feed and writes what came back.
@@ -77,10 +79,20 @@ pub fn refresh(store: &mut Store, fetcher: &Fetcher, options: Options) -> Result
             let tx = tx.clone();
             let queue = &queue;
             scope.spawn(move || {
-                while let Some(host) = queue.lock().unwrap().pop() {
+                loop {
+                    // The guard must be dropped before fetching: held across
+                    // the body it would serialise every worker on the queue.
+                    let next = queue.lock().unwrap().pop();
+                    let Some(host) = next else { return };
                     for feed in host {
+                        let started = std::time::Instant::now();
                         let work = fetch_one(fetcher, &feed);
-                        if tx.send(Done { feed, work }).is_err() {
+                        let done = Done {
+                            feed,
+                            work,
+                            elapsed_ms: started.elapsed().as_millis(),
+                        };
+                        if tx.send(done).is_err() {
                             return;
                         }
                     }
@@ -117,16 +129,24 @@ fn fetch_one(fetcher: &Fetcher, feed: &Feed) -> Work {
     };
     match fetcher.get(&feed.url, &cached) {
         Ok(Fetched::NotModified) => Work::NotModified,
-        Ok(Fetched::Body { bytes, validators }) => match parse::parse(&feed.url, &bytes) {
+        Ok(Fetched::Body {
+            bytes,
+            validators,
+            content_type,
+        }) => match parse::parse(&feed.url, &bytes) {
             Ok(parsed) => Work::Parsed(Box::new(parsed), validators),
-            Err(e) => Work::Failed(e),
+            Err(e) => Work::Failed(explain(e, content_type.as_deref())),
         },
         Err(e) => Work::Failed(e),
     }
 }
 
 fn write_one(store: &mut Store, done: Done) -> Result<FeedOutcome> {
-    let Done { feed, work } = done;
+    let Done {
+        feed,
+        work,
+        elapsed_ms,
+    } = done;
     let status = match work {
         Work::Parsed(parsed, validators) => {
             store.update_feed_meta(feed.id, parsed.title.as_deref(), parsed.site_url.as_deref())?;
@@ -150,7 +170,23 @@ fn write_one(store: &mut Store, done: Done) -> Result<FeedOutcome> {
     Ok(FeedOutcome {
         url: feed.url,
         status,
+        elapsed_ms,
     })
+}
+
+/// A feed URL that has quietly become a web page is the common case behind a
+/// parse failure, and the raw XML error does not say so.
+fn explain(error: Error, content_type: Option<&str>) -> Error {
+    let looks_like_a_page = content_type
+        .map(|value| value.starts_with("text/html"))
+        .unwrap_or(false);
+    match (error, looks_like_a_page) {
+        (Error::Parse { url, message }, true) => Error::Parse {
+            url,
+            message: format!("{message} (the server sent a web page, not a feed)"),
+        },
+        (error, _) => error,
+    }
 }
 
 fn host_of(url: &str) -> String {
@@ -166,13 +202,22 @@ mod tests {
     use crate::opml::Subscription;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
+    use std::time::Duration;
 
     const RSS: &str = "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel><title>T</title>\
 <link>https://example.com</link><item><title>One</title><guid>a</guid>\
 <link>https://example.com/a</link></item></channel></rss>";
 
+    fn slow_serve(body: &'static str, delay: Duration) -> String {
+        serve_with(body, "200 OK", delay)
+    }
+
     /// Answers every request with the same response until dropped.
     fn serve(body: &'static str, status: &'static str) -> String {
+        serve_with(body, status, Duration::ZERO)
+    }
+
+    fn serve_with(body: &'static str, status: &'static str, delay: Duration) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
@@ -185,6 +230,7 @@ mod tests {
                         break;
                     }
                 }
+                std::thread::sleep(delay);
                 let response = format!(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
@@ -238,6 +284,25 @@ mod tests {
         let again = refresh(&mut store, &fetcher, Options::default()).unwrap();
         assert_eq!(again.new_items, 0);
         assert_eq!(store.unread_count().unwrap(), 1);
+    }
+
+    /// Four hosts that each take a beat to answer must overlap, not queue up.
+    #[test]
+    fn feeds_on_different_hosts_are_fetched_at_the_same_time() {
+        let mut store = Store::open_in_memory().unwrap();
+        for _ in 0..4 {
+            subscribe(&mut store, &slow_serve(RSS, Duration::from_millis(300)));
+        }
+
+        let started = std::time::Instant::now();
+        let summary = refresh(&mut store, &Fetcher::new(), Options { workers: 4 }).unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(summary.failed, 0);
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "four 300ms feeds took {elapsed:?}, so they ran one after another"
+        );
     }
 
     #[test]
