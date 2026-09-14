@@ -88,6 +88,8 @@ pub struct Feed {
     pub id: i64,
     pub url: String,
     pub title: Option<String>,
+    /// The site the feed belongs to, as the feed itself gives it.
+    pub site_url: Option<String>,
     pub folder: Option<String>,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
@@ -381,8 +383,8 @@ impl Store {
 
     pub fn feeds(&self) -> Result<Vec<Feed>> {
         let mut stmt = self.conn.prepare(
-            "SELECT feeds.id, feeds.url, feeds.title, feeds.folder, feeds.etag,
-                    feeds.last_modified, feeds.fetched_at, feeds.full_content,
+            "SELECT feeds.id, feeds.url, feeds.title, feeds.site_url, feeds.folder,
+                    feeds.etag, feeds.last_modified, feeds.fetched_at, feeds.full_content,
                     feeds.status, feeds.error,
                     COUNT(items.id) FILTER (WHERE items.read = 0)
              FROM feeds LEFT JOIN items ON items.feed_id = feeds.id
@@ -394,14 +396,15 @@ impl Store {
                 id: row.get(0)?,
                 url: row.get(1)?,
                 title: row.get(2)?,
-                folder: row.get(3)?,
-                etag: row.get(4)?,
-                last_modified: row.get(5)?,
-                fetched_at: row.get::<_, Option<String>>(6)?.and_then(parse_stamp),
-                full_content: row.get::<_, i64>(7)? != 0,
-                status: row.get(8)?,
-                error: row.get(9)?,
-                unread: row.get(10)?,
+                site_url: row.get(3)?,
+                folder: row.get(4)?,
+                etag: row.get(5)?,
+                last_modified: row.get(6)?,
+                fetched_at: row.get::<_, Option<String>>(7)?.and_then(parse_stamp),
+                full_content: row.get::<_, i64>(8)? != 0,
+                status: row.get(9)?,
+                error: row.get(10)?,
+                unread: row.get(11)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)

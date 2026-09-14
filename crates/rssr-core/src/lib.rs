@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod charset;
 pub mod content;
 pub mod discover;

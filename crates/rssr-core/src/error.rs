@@ -24,6 +24,8 @@ pub enum Error {
     },
     Opml(String),
     Config(String),
+    /// Nothing on this machine could be asked to open a web page.
+    NoOpener(String),
     /// A malformed argument. The caller made the mistake, not the network.
     Usage(String),
 }
@@ -47,6 +49,7 @@ impl Error {
             Error::Extract { .. } => "EXTRACT_FAILED",
             Error::Opml(_) => "OPML_INVALID",
             Error::Config(_) => "CONFIG_ERROR",
+            Error::NoOpener(_) => "NO_OPENER",
             Error::Usage(_) => "USAGE_ERROR",
         }
     }
@@ -65,6 +68,7 @@ impl fmt::Display for Error {
             Error::Extract { url, message } => write!(f, "extract {url}: {message}"),
             Error::Opml(e) => write!(f, "opml: {e}"),
             Error::Config(e) => write!(f, "config: {e}"),
+            Error::NoOpener(e) => write!(f, "nothing to open a page with: {e}"),
             Error::Usage(e) => write!(f, "{e}"),
         }
     }
