@@ -243,7 +243,9 @@ fn main() -> ExitCode {
             }
             eprintln!("rssr: {e}");
             match e {
-                rssr_core::Error::Usage(_) => ExitCode::from(USAGE),
+                // Both are the caller handing over something malformed, which
+                // is what exit code 2 is for.
+                rssr_core::Error::Usage(_) | rssr_core::Error::Opml(_) => ExitCode::from(USAGE),
                 _ => ExitCode::from(1),
             }
         }

@@ -20,6 +20,7 @@ pub fn parse(xml: &[u8]) -> Result<Vec<Subscription>> {
     let mut stack: Vec<Option<String>> = Vec::new();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut is_opml = false;
 
     loop {
         match reader.read_event_into(&mut buf)? {
@@ -42,12 +43,23 @@ pub fn parse(xml: &[u8]) -> Result<Vec<Subscription>> {
             Event::End(e) if e.name().as_ref().eq_ignore_ascii_case("outline") => {
                 stack.pop();
             }
+            Event::Start(e) | Event::Empty(e) if e.name().as_ref().eq_ignore_ascii_case("opml") => {
+                is_opml = true;
+            }
             Event::Eof => break,
             _ => {}
         }
         buf.clear();
     }
 
+    // Reading anything at all and calling it a subscription list makes a
+    // mistyped path that happens to exist look like a successful import, and
+    // makes a text file indistinguishable from an export with nothing in it.
+    if !is_opml && out.is_empty() {
+        return Err(Error::Opml(
+            "no <opml> element; this is not a subscription list".into(),
+        ));
+    }
     Ok(out)
 }
 
@@ -328,6 +340,24 @@ mod tests {
         let xml = write(&subs).unwrap();
         assert_eq!(xml.matches("<outline").count(), 1);
         assert_eq!(parse(xml.as_bytes()).unwrap()[0].folder, None);
+    }
+
+    #[test]
+    fn a_file_that_is_not_a_subscription_list_is_refused() {
+        for text in [
+            "this is not xml at all",
+            "<html><body><p>hi</p></body></html>",
+            "",
+            "<?xml version=\"1.0\"?><rss version=\"2.0\"><channel/></rss>",
+        ] {
+            assert!(parse(text.as_bytes()).is_err(), "{text:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn an_export_with_nothing_in_it_is_still_a_subscription_list() {
+        let xml = r#"<?xml version="1.0"?><opml version="2.0"><body></body></opml>"#;
+        assert!(parse(xml.as_bytes()).unwrap().is_empty());
     }
 
     #[test]
