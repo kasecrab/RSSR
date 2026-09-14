@@ -57,6 +57,11 @@ enum Command {
         #[arg(long)]
         update: bool,
     },
+    /// Write every subscription out as OPML, for a backup or another reader.
+    Export {
+        /// Write here instead of standard output.
+        file: Option<PathBuf>,
+    },
     /// Fetch new items.
     Refresh {
         #[arg(long, value_name = "ID")]
@@ -232,6 +237,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             force,
         } => add(&mut store, url, folder, title, *force, json),
         Command::Import { file, update } => import(&store, file, *update, json),
+        Command::Export { file } => export(&store, file.as_deref(), json),
         Command::Refresh {
             feed,
             workers,
@@ -528,6 +534,50 @@ fn import(store: &Store, file: &PathBuf, update: bool, as_json: bool) -> Result<
         if !update && unchanged > 0 {
             println!("(titles and folders already stored were kept; --update replaces them)");
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The other half of `import`: everything subscribed, in a file another
+/// reader can take. Without a path the OPML goes to standard output, so it can
+/// be piped somewhere without landing on disk first.
+fn export(store: &Store, file: Option<&Path>, as_json: bool) -> Result<ExitCode> {
+    let feeds = store.feeds()?;
+    let subscriptions: Vec<Subscription> = feeds
+        .iter()
+        .map(|feed| Subscription {
+            url: feed.url.clone(),
+            title: feed.title.clone(),
+            folder: feed.folder.clone(),
+        })
+        .collect();
+    let xml = opml::write(&subscriptions)?;
+    let folders = store.folders()?.len();
+
+    match file {
+        Some(path) => {
+            std::fs::write(path, &xml)?;
+            if as_json {
+                print(&json!({
+                    "feeds": subscriptions.len(),
+                    "folders": folders,
+                    "path": path.display().to_string(),
+                }));
+            } else {
+                println!(
+                    "exported {} feeds to {}",
+                    subscriptions.len(),
+                    path.display()
+                );
+            }
+        }
+        None if as_json => print(&json!({
+            "feeds": subscriptions.len(),
+            "folders": folders,
+            "path": Value::Null,
+            "opml": xml,
+        })),
+        None => print!("{xml}"),
     }
     Ok(ExitCode::SUCCESS)
 }
