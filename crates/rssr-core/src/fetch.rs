@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ureq::Agent;
+use ureq::{Agent, ResponseExt};
 
 use crate::{Error, Result};
 
@@ -19,6 +19,10 @@ pub struct Validators {
 pub struct Page {
     pub bytes: Vec<u8>,
     pub content_type: Option<String>,
+    /// Where the page came from once redirects were followed. A relative
+    /// address on the page resolves against this, not against what was asked
+    /// for, or a site that redirects to a subdirectory resolves them wrongly.
+    pub final_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -96,6 +100,7 @@ impl Fetcher {
         }
 
         let content_type = header(&resp, "content-type");
+        let final_url = Some(resp.get_uri().to_string()).filter(|uri| !uri.is_empty());
         let bytes = resp
             .body_mut()
             .with_config()
@@ -109,6 +114,7 @@ impl Fetcher {
         Ok(Page {
             bytes,
             content_type,
+            final_url,
         })
     }
 
@@ -196,6 +202,17 @@ mod tests {
             let _ = tx.send(request);
         });
         (format!("http://{addr}/feed.xml"), rx)
+    }
+
+    #[test]
+    fn a_page_reports_where_it_actually_came_from() {
+        let (url, _rx) = serve(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        let page = Fetcher::new().get_page(&url).unwrap();
+        assert_eq!(page.bytes, b"hi");
+        assert_eq!(page.content_type.as_deref(), Some("text/html"));
+        assert_eq!(page.final_url.as_deref(), Some(url.as_str()));
     }
 
     #[test]

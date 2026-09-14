@@ -4,10 +4,11 @@ use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeZone, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
+use rssr_core::discover::Candidate;
 use rssr_core::opml::Subscription;
 use rssr_core::refresh::{self, Options, Status};
 use rssr_core::store::{Flag, Item, Query, Stats, Upsert};
-use rssr_core::{Fetcher, Result, Store, content, duration, extract, fetch, opml};
+use rssr_core::{Fetcher, Result, Store, content, discover, duration, extract, fetch, opml};
 use serde_json::{Value, json};
 
 /// Exit codes, used the same way by every subcommand:
@@ -455,6 +456,17 @@ fn next_steps(stats: &Stats) -> Vec<&'static str> {
     }
 }
 
+/// Subscribing to what was given, without yet deciding whether to keep it:
+/// the caller may want it thrown away again, because a page is not a feed and
+/// a feed that fails its first fetch is how a dead subscription list grows.
+struct Attempt {
+    id: i64,
+    added: bool,
+    title: Option<String>,
+    new_items: usize,
+    failure: Option<(&'static str, String)>,
+}
+
 fn add(
     store: &mut Store,
     url: &str,
@@ -463,9 +475,62 @@ fn add(
     force: bool,
     as_json: bool,
 ) -> Result<ExitCode> {
+    let asked = discover::absolute(url);
+    let attempt = try_feed(store, &asked, folder, title.clone())?;
+
+    // People know a site by its home page, not by the address of its feed. A
+    // page only announces that it is not a feed by failing to parse, so that
+    // is where discovery starts: an address that really is a feed costs
+    // nothing extra, which is the common case.
+    let advertised = match &attempt.failure {
+        Some((code, _)) if *code == "FEED_PARSE_FAILED" => {
+            discover::from_page(&Fetcher::new(), &asked).unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
+    if advertised.is_empty() {
+        return report(store, &asked, attempt, None, force, as_json);
+    }
+
+    // What was given turned out to be a page. Nothing is gained by leaving it
+    // subscribed whatever --force says, since it will never parse.
+    if attempt.added {
+        store.remove_feed(attempt.id)?;
+    }
+
+    // One feed means the page had a feed and this is it. Several means a
+    // choice, and picking one of them here would sooner or later pick wrong.
+    let found = {
+        let first_class: Vec<&Candidate> = advertised
+            .iter()
+            .filter(|candidate| !candidate.secondary)
+            .collect();
+        match first_class.as_slice() {
+            [only] => (*only).clone(),
+            _ => return ambiguous(&asked, &advertised, as_json),
+        }
+    };
+    let mut attempt = try_feed(store, &found.url, folder, title.clone())?;
+    // The page's label for a feed is a fallback, not an override: a feed that
+    // names itself knows better than whatever linked to it.
+    if attempt.title.is_none()
+        && let Some(label) = &found.title
+    {
+        store.update_feed_meta(attempt.id, Some(label), None)?;
+        attempt.title = Some(label.clone());
+    }
+    report(store, &found.url, attempt, Some(&asked), force, as_json)
+}
+
+fn try_feed(
+    store: &mut Store,
+    url: &str,
+    folder: &Option<String>,
+    title: Option<String>,
+) -> Result<Attempt> {
     let subscription = Subscription {
         url: url.to_string(),
-        title: title.clone(),
+        title,
         folder: folder.clone(),
     };
     let (id, outcome) = store.upsert_feed(&subscription, false)?;
@@ -478,7 +543,6 @@ fn add(
             ..Options::default()
         },
     )?;
-    let new_items = summary.new_items;
     let failure = summary
         .outcomes
         .iter()
@@ -486,37 +550,63 @@ fn add(
             Status::Failed { code, message } => Some((*code, message.clone())),
             _ => None,
         });
+    let stored = store.feeds()?.into_iter().find(|feed| feed.id == id);
 
+    Ok(Attempt {
+        id,
+        added: outcome == Upsert::Added,
+        title: stored.and_then(|feed| feed.title),
+        new_items: summary.new_items,
+        failure,
+    })
+}
+
+fn report(
+    store: &Store,
+    url: &str,
+    attempt: Attempt,
+    from_page: Option<&str>,
+    force: bool,
+    as_json: bool,
+) -> Result<ExitCode> {
     // A feed that cannot be fetched even once is how a dead subscription list
     // accumulates. Keep it only if the caller insists, or if it was already
     // subscribed and this was just a bad day.
-    let rolled_back = failure.is_some() && outcome == Upsert::Added && !force;
+    let rolled_back = attempt.failure.is_some() && attempt.added && !force;
     if rolled_back {
-        store.remove_feed(id)?;
+        store.remove_feed(attempt.id)?;
     }
-
-    let stored = store.feeds()?.into_iter().find(|feed| feed.id == id);
-    let feed_title = stored.and_then(|feed| feed.title);
 
     if as_json {
         print(&json!({
-            "feed": (!rolled_back).then_some(id),
+            "feed": (!rolled_back).then_some(attempt.id),
             "url": url,
-            "title": feed_title,
-            "added": outcome == Upsert::Added && !rolled_back,
+            "title": attempt.title,
+            "added": attempt.added && !rolled_back,
             "kept": !rolled_back,
-            "new_items": new_items,
-            "error": failure.as_ref().map(|(_, message)| message),
-            "code": failure.as_ref().map(|(code, _)| *code),
+            "new_items": attempt.new_items,
+            "discovered_from": from_page,
+            "error": attempt.failure.as_ref().map(|(_, message)| message),
+            "code": attempt.failure.as_ref().map(|(code, _)| *code),
         }));
     } else {
-        match (&outcome, &failure) {
-            (Upsert::Added, None) => println!(
-                "feed {id}: {} - {new_items} items",
-                feed_title.as_deref().unwrap_or(url)
-            ),
-            (_, None) => println!("feed {id}: already subscribed - {new_items} new items"),
-            (_, Some((code, message))) => {
+        match (&attempt.failure, attempt.added) {
+            (None, added) => {
+                if let Some(page) = from_page {
+                    println!("{page} advertises {url}");
+                }
+                let id = attempt.id;
+                let new_items = attempt.new_items;
+                if added {
+                    println!(
+                        "feed {id}: {} - {new_items} items",
+                        attempt.title.as_deref().unwrap_or(url)
+                    );
+                } else {
+                    println!("feed {id}: already subscribed - {new_items} new items");
+                }
+            }
+            (Some((code, message)), _) => {
                 eprintln!("{url}: {code} {message}");
                 if rolled_back {
                     eprintln!(
@@ -526,10 +616,46 @@ fn add(
             }
         }
     }
-    Ok(match failure {
+    Ok(match attempt.failure {
         Some(_) => ExitCode::from(FAILED),
         None => ExitCode::SUCCESS,
     })
+}
+
+/// Several feeds behind one page, and nothing here can tell which one was
+/// meant. Listing them is more use than subscribing to the wrong one.
+fn ambiguous(page: &str, advertised: &[Candidate], as_json: bool) -> Result<ExitCode> {
+    if as_json {
+        let candidates: Vec<_> = advertised
+            .iter()
+            .map(|candidate| {
+                json!({
+                    "url": candidate.url,
+                    "title": candidate.title,
+                    "secondary": candidate.secondary,
+                })
+            })
+            .collect();
+        print(&json!({
+            "url": page,
+            "kept": false,
+            "error": format!("{} feeds advertised, none of them obviously the one", advertised.len()),
+            "code": "FEED_AMBIGUOUS",
+            "candidates": candidates,
+        }));
+    } else {
+        eprintln!(
+            "{page} advertises {} feeds; subscribe to one of them:",
+            advertised.len()
+        );
+        for candidate in advertised {
+            match &candidate.title {
+                Some(title) => eprintln!("  rssr add {}   # {title}", candidate.url),
+                None => eprintln!("  rssr add {}", candidate.url),
+            }
+        }
+    }
+    Ok(ExitCode::from(USAGE))
 }
 
 fn import(store: &Store, file: &PathBuf, update: bool, as_json: bool) -> Result<ExitCode> {

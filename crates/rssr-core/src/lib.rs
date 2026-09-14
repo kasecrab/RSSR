@@ -1,5 +1,6 @@
 pub mod charset;
 pub mod content;
+pub mod discover;
 pub mod duration;
 mod error;
 pub mod extract;
