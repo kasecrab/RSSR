@@ -162,6 +162,21 @@ enum Command {
         #[arg(required = true)]
         ids: Vec<String>,
     },
+    /// Delete items past a retention window. Off until one is set.
+    Prune {
+        /// Remember this window and apply it on every refresh, or "off" to stop.
+        #[arg(long, value_name = "DURATION|off", conflicts_with = "older_than")]
+        set: Option<String>,
+        /// Prune to this window once, without changing the stored one.
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+        /// Count what would go without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Delete starred items too. They are kept by default.
+        #[arg(long)]
+        starred: bool,
+    },
     /// Scrape the full article for items whose feed only sent a teaser.
     Extract {
         ids: Vec<String>,
@@ -321,6 +336,19 @@ fn run(cli: &Cli) -> Result<ExitCode> {
             search(&store, text, query, json)
         }
         Command::Mark { flag, ids } => mark(&store, ids, (*flag).into(), json),
+        Command::Prune {
+            set,
+            older_than,
+            dry_run,
+            starred,
+        } => prune(
+            &store,
+            set.as_deref(),
+            older_than.as_deref(),
+            *dry_run,
+            *starred,
+            json,
+        ),
         Command::Extract {
             ids,
             pending,
@@ -343,6 +371,7 @@ fn run(cli: &Cli) -> Result<ExitCode> {
 /// commands worth running next. An agent should not need a manual to start.
 fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
     let stats = store.stats()?;
+    let retention = store.retention()?.map(duration::render);
     let recent = store.items(&Query {
         limit: 8,
         per_feed: Some(1),
@@ -361,6 +390,7 @@ fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
             "full_text": stats.full_text,
             "failing_feeds": stats.failing,
             "last_refresh": stats.last_refresh,
+            "retention": retention,
             "recent": rows(&recent),
             "next": next,
         }));
@@ -386,6 +416,9 @@ fn status(store: &Store, db: &Path, as_json: bool) -> Result<ExitCode> {
         match &stats.last_refresh {
             Some(at) => println!("last refresh: {at}"),
             None => println!("last refresh: never"),
+        }
+        if let Some(window) = &retention {
+            println!("pruning: items older than {window}, starred kept");
         }
         if !recent.is_empty() {
             println!();
@@ -597,6 +630,15 @@ fn do_refresh(
         Default::default()
     };
 
+    // A stored window is a standing instruction: the point of setting one is
+    // not having to remember to prune. A refresh aimed at a single feed leaves
+    // it alone, since deleting items from every other feed is not what was
+    // asked for.
+    let pruned = match (options.only_feed, store.retention()?) {
+        (None, Some(window)) => store.prune(duration::ago(window)?, true)?,
+        _ => 0,
+    };
+
     let by_url: std::collections::HashMap<String, i64> = store
         .feeds()?
         .into_iter()
@@ -636,6 +678,7 @@ fn do_refresh(
             "failed": summary.failed,
             "extracted": extracted.extracted,
             "extract_failed": extracted.failed,
+            "pruned": pruned,
         }));
     } else {
         for outcome in &summary.outcomes {
@@ -659,6 +702,9 @@ fn do_refresh(
                 "{} articles scraped, {} failed",
                 extracted.extracted, extracted.failed
             );
+        }
+        if pruned > 0 {
+            println!("{pruned} items pruned");
         }
     }
 
@@ -832,6 +878,8 @@ fn why_empty(store: &Store, query: &Query) -> Result<String> {
     let stats = store.stats()?;
     Ok(if stats.feeds == 0 {
         "no feeds subscribed - run `rssr add <url>`".into()
+    } else if stats.items == 0 && stats.last_refresh.is_some() {
+        "nothing stored - the feeds carried nothing, or a prune took it".into()
     } else if stats.items == 0 {
         "feeds are subscribed but never fetched - run `rssr refresh`".into()
     } else if query.starred_only {
@@ -1092,6 +1140,105 @@ fn backfill(store: &mut Store, limit: usize, feed: Option<i64>, as_json: bool) -
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// Deleting is the one thing a reader does that cannot be undone, so it stays
+/// off until a window is asked for, starred items are spared, and `--dry-run`
+/// says what would go before anything does.
+fn prune(
+    store: &Store,
+    set: Option<&str>,
+    older_than: Option<&str>,
+    dry_run: bool,
+    starred: bool,
+    as_json: bool,
+) -> Result<ExitCode> {
+    if let Some(value) = set {
+        let window = match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "never" | "none" => None,
+            _ => Some(retention_window(value)?),
+        };
+        store.set_retention(window)?;
+        if as_json {
+            print(&json!({
+                "retention": window.map(duration::render),
+                "retention_secs": window.map(|window| window.as_secs()),
+            }));
+        } else if let Some(window) = window {
+            println!(
+                "pruning on: items older than {} go on every refresh, starred ones stay",
+                duration::render(window)
+            );
+        } else {
+            println!("pruning off: nothing is deleted");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let window = match older_than {
+        Some(value) => Some(retention_window(value)?),
+        None => store.retention()?,
+    };
+    let Some(window) = window else {
+        if as_json {
+            print(&json!({ "error": "pruning is off", "code": "USAGE_ERROR" }));
+        }
+        eprintln!(
+            "rssr: pruning is off. `rssr prune --set 15d` turns it on for good, \
+             `rssr prune --older-than 15d` does it once"
+        );
+        return Ok(ExitCode::from(USAGE));
+    };
+
+    let before = duration::ago(window)?;
+    let keep_starred = !starred;
+    let matched = store.prunable(before, keep_starred)?;
+    let deleted = if dry_run {
+        0
+    } else {
+        store.prune(before, keep_starred)?
+    };
+    // What is old but starred: the one number that explains the gap between
+    // how much is past the window and how much of it actually goes.
+    let kept_starred = if keep_starred {
+        store.prunable(before, false)? - if dry_run { matched } else { 0 }
+    } else {
+        0
+    };
+
+    let window = duration::render(window);
+    if as_json {
+        print(&json!({
+            "dry_run": dry_run,
+            "window": window,
+            "matched": matched,
+            "deleted": deleted,
+            "kept_starred": kept_starred,
+        }));
+    } else {
+        let starred_note = match kept_starred {
+            0 => String::new(),
+            n => format!("; {n} starred kept"),
+        };
+        match (matched, dry_run) {
+            (0, _) => println!("nothing older than {window}{starred_note}"),
+            (n, true) => println!("{n} items older than {window} would go{starred_note}"),
+            (n, false) => println!("{n} items older than {window} deleted{starred_note}"),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// A window of zero is always a typo, and acting on it would empty the
+/// database. Nothing else about a duration is this unforgiving.
+fn retention_window(value: &str) -> Result<Duration> {
+    let window = duration::parse(value)?;
+    if window.is_zero() {
+        return Err(rssr_core::Error::Usage(format!(
+            "a window of {value:?} would delete everything; give a duration like 15d"
+        )));
+    }
+    Ok(window)
 }
 
 fn missing_feed(store: &Store, id: i64, as_json: bool) -> Result<ExitCode> {

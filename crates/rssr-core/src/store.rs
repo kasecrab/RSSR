@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -211,7 +212,33 @@ const SCHEMA_V3: &str = r#"
 ALTER TABLE feeds ADD COLUMN full_content INTEGER NOT NULL DEFAULT 0;
 "#;
 
-const LATEST_VERSION: i64 = 3;
+/// The age of an item is `COALESCE(published, updated, seen_at)`, which no
+/// plain column index can serve. Indexing the expression itself lets a prune
+/// seek straight to the old rows instead of reading the table, and gives the
+/// listing's `ORDER BY at DESC` an index to walk backwards.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE INDEX items_by_age ON items(COALESCE(published, updated, seen_at));
+"#;
+
+const LATEST_VERSION: i64 = 4;
+
+/// The one setting that has to outlive a command: how long items are kept.
+const RETENTION_KEY: &str = "retention_secs";
+
+/// Two statements rather than one with a bound flag, so the planner sees a
+/// constant predicate and can use the age index in both.
+fn older_than(keep_starred: bool) -> &'static str {
+    if keep_starred {
+        "COALESCE(published, updated, seen_at) < ?1 AND starred = 0"
+    } else {
+        "COALESCE(published, updated, seen_at) < ?1"
+    }
+}
 
 const FILTER: &str = "WHERE (?1 = 0 OR items.read = 0)
               AND (?2 IS NULL OR items.feed_id = ?2)
@@ -269,7 +296,12 @@ impl Store {
         let version: i64 = self
             .conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        for (target, statements) in [(1, SCHEMA_V1), (2, SCHEMA_V2), (3, SCHEMA_V3)] {
+        for (target, statements) in [
+            (1, SCHEMA_V1),
+            (2, SCHEMA_V2),
+            (3, SCHEMA_V3),
+            (4, SCHEMA_V4),
+        ] {
             if version < target {
                 self.conn.execute_batch(statements)?;
             }
@@ -696,6 +728,69 @@ impl Store {
             })?)
     }
 
+    fn setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    fn set_setting(&self, key: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(value) => self.conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )?,
+            None => self
+                .conn
+                .execute("DELETE FROM settings WHERE key = ?1", [key])?,
+        };
+        Ok(())
+    }
+
+    /// How long items are kept. `None` means for ever, which is the default:
+    /// nothing is ever deleted until a window is asked for.
+    pub fn retention(&self) -> Result<Option<Duration>> {
+        let Some(raw) = self.setting(RETENTION_KEY)? else {
+            return Ok(None);
+        };
+        let seconds: u64 = raw.parse().map_err(|_| {
+            Error::Config(format!("stored retention window is not a number: {raw:?}"))
+        })?;
+        Ok(Some(Duration::from_secs(seconds)))
+    }
+
+    pub fn set_retention(&self, window: Option<Duration>) -> Result<()> {
+        let seconds = window.map(|window| window.as_secs().to_string());
+        self.set_setting(RETENTION_KEY, seconds.as_deref())
+    }
+
+    /// How many items a prune to `before` would take, for a dry run.
+    pub fn prunable(&self, before: DateTime<Utc>, keep_starred: bool) -> Result<usize> {
+        let sql = format!(
+            "SELECT COUNT(*) FROM items WHERE {}",
+            older_than(keep_starred)
+        );
+        let count: i64 = self
+            .conn
+            .query_row(&sql, [stamp(before)], |row| row.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Deletes items dated before `before`, and reports how many went. Their
+    /// bodies follow through the foreign key and the search index through its
+    /// triggers, so nothing is left pointing at a row that is gone.
+    ///
+    /// Starring is how an item is kept, so starred items are spared unless the
+    /// caller says otherwise.
+    pub fn prune(&self, before: DateTime<Utc>, keep_starred: bool) -> Result<usize> {
+        let sql = format!("DELETE FROM items WHERE {}", older_than(keep_starred));
+        Ok(self.conn.execute(&sql, [stamp(before)])?)
+    }
+
     pub fn default_path() -> Result<PathBuf> {
         let dir = dirs::data_dir()
             .ok_or_else(|| Error::Config("no data directory for this platform".into()))?;
@@ -869,6 +964,179 @@ mod tests {
             url: url.into(),
             title: Some("Title".into()),
             folder: folder.map(Into::into),
+        }
+    }
+
+    /// An item dated `days` ago, so a prune has something to measure.
+    fn aged(id: &str, days: i64) -> ParsedItem {
+        ParsedItem {
+            published: Some(Utc::now() - chrono::Duration::days(days)),
+            ..item(id, id)
+        }
+    }
+
+    fn stocked(days: &[i64]) -> (Store, i64) {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        let items: Vec<ParsedItem> = days
+            .iter()
+            .map(|&day| aged(&format!("item-{day}"), day))
+            .collect();
+        store.save_items(feed, &items).unwrap();
+        (store, feed)
+    }
+
+    fn cutoff(days: i64) -> DateTime<Utc> {
+        Utc::now() - chrono::Duration::days(days)
+    }
+
+    #[test]
+    fn nothing_is_kept_or_dropped_until_a_window_is_set() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.retention().unwrap(), None);
+        store.set_retention(Some(Duration::from_secs(900))).unwrap();
+        assert_eq!(store.retention().unwrap(), Some(Duration::from_secs(900)));
+        store.set_retention(None).unwrap();
+        assert_eq!(store.retention().unwrap(), None);
+    }
+
+    #[test]
+    fn a_window_survives_reopening_the_database() {
+        let dir = std::env::temp_dir().join(format!("rssr-retention-{}", std::process::id()));
+        let path = dir.join("rssr.db");
+        let _ = std::fs::remove_dir_all(&dir);
+        Store::open(&path)
+            .unwrap()
+            .set_retention(Some(Duration::from_secs(1_296_000)))
+            .unwrap();
+        let reopened = Store::open(&path).unwrap().retention().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reopened, Some(Duration::from_secs(1_296_000)));
+    }
+
+    #[test]
+    fn a_stored_window_that_is_not_a_number_is_reported_rather_than_ignored() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_setting(RETENTION_KEY, Some("a fortnight"))
+            .unwrap();
+        assert!(store.retention().is_err());
+    }
+
+    #[test]
+    fn pruning_takes_the_old_items_and_leaves_the_rest() {
+        let (store, _) = stocked(&[1, 10, 20, 40]);
+        assert_eq!(store.prune(cutoff(15), true).unwrap(), 2);
+        let left = store.items(&any()).unwrap();
+        assert_eq!(left.len(), 2);
+        assert!(
+            left.iter()
+                .all(|item| item.title.as_deref() != Some("item-20"))
+        );
+    }
+
+    #[test]
+    fn a_starred_item_is_kept_however_old_it_is() {
+        let (store, _) = stocked(&[1, 40]);
+        let old = store.items(&any()).unwrap().pop().unwrap().id;
+        store
+            .set_flag(std::slice::from_ref(&old), Flag::Star)
+            .unwrap();
+        assert_eq!(store.prune(cutoff(15), true).unwrap(), 0);
+        assert_eq!(store.prune(cutoff(15), false).unwrap(), 1);
+        assert!(store.body(&old).unwrap().is_none());
+    }
+
+    #[test]
+    fn reading_an_item_does_not_protect_it_and_leaving_it_unread_does_not_either() {
+        let (store, _) = stocked(&[40, 41]);
+        let ids: Vec<String> = store
+            .items(&any())
+            .unwrap()
+            .into_iter()
+            .map(|i| i.id)
+            .collect();
+        store.set_flag(&ids[..1], Flag::Read).unwrap();
+        assert_eq!(store.prune(cutoff(15), true).unwrap(), 2);
+    }
+
+    #[test]
+    fn an_item_with_no_date_of_its_own_is_aged_by_when_it_was_seen() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        let undated = ParsedItem {
+            published: None,
+            updated: None,
+            ..item("undated", "Undated")
+        };
+        store.save_items(feed, &[undated]).unwrap();
+        // Seen just now, so a window of anything but zero keeps it.
+        assert_eq!(store.prune(cutoff(1), true).unwrap(), 0);
+        assert_eq!(
+            store
+                .prune(Utc::now() + chrono::Duration::seconds(1), true)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pruned_item_takes_its_body_and_its_index_entry_with_it() {
+        let mut store = Store::open_in_memory().unwrap();
+        let feed = add(&store, "https://a.com/feed", None);
+        let old = ParsedItem {
+            title: Some("Vanishing headline".into()),
+            content: Some("<p>Body worth indexing.</p>".into()),
+            ..aged("old", 40)
+        };
+        store.save_items(feed, &[old]).unwrap();
+        let id = store.items(&any()).unwrap()[0].id.clone();
+        assert!(store.body(&id).unwrap().is_some());
+
+        assert_eq!(store.prune(cutoff(15), true).unwrap(), 1);
+        assert!(store.body(&id).unwrap().is_none());
+        assert!(store.search("Vanishing", &any()).unwrap().is_empty());
+        let orphans: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM bodies", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    #[test]
+    fn a_dry_run_counts_the_same_items_it_would_have_deleted() {
+        let (store, _) = stocked(&[1, 10, 20, 40]);
+        assert_eq!(store.prunable(cutoff(15), true).unwrap(), 2);
+        assert_eq!(store.items(&any()).unwrap().len(), 4);
+        assert_eq!(store.prune(cutoff(15), true).unwrap(), 2);
+        assert_eq!(store.prunable(cutoff(15), true).unwrap(), 0);
+    }
+
+    #[test]
+    fn pruning_an_empty_database_deletes_nothing_and_does_not_fail() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(store.prune(cutoff(15), true).unwrap(), 0);
+        assert_eq!(store.prunable(cutoff(15), true).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_prune_seeks_the_old_rows_instead_of_reading_the_table() {
+        let (store, _) = stocked(&[1, 40]);
+        for keep_starred in [true, false] {
+            let sql = format!(
+                "SELECT COUNT(*) FROM items WHERE {}",
+                older_than(keep_starred)
+            );
+            let plan: String = store
+                .conn
+                .query_row(&format!("EXPLAIN QUERY PLAN {sql}"), ["x"], |row| {
+                    row.get(3)
+                })
+                .unwrap();
+            assert!(
+                plan.contains("items_by_age"),
+                "keep_starred={keep_starred}: {plan}"
+            );
         }
     }
 
